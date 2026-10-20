@@ -1,0 +1,19 @@
+luxir-lucene
+Copyright 2026 Ishan Chattopadhyaya and luxir-lucene contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It builds against and links with the following software, each under its own
+license:
+
+  Luxir (https://github.com/luxir-search/luxir)
+    Copyright 2020-2026 Yonik Seeley and Luxir contributors
+    Apache License 2.0
+    The native library (libluxir_lucene.so) is built inside a Luxir checkout
+    and statically links Luxir and the third-party code listed in Luxir's
+    NOTICE file. Binary distributions of the native library must carry that
+    NOTICE as well.
+
+  Apache Lucene (https://lucene.apache.org/)
+    Copyright The Apache Software Foundation
+    Apache License 2.0

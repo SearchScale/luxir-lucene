@@ -1,0 +1,63 @@
+// Copyright 2026 Ishan Chattopadhyaya and luxir-lucene contributors
+// SPDX-License-Identifier: Apache-2.0
+
+// luxir-lucene: a Lucene PostingsFormat that stores text postings in Luxir's
+// segment format and runs Luxir's per-segment query execution over them
+// (native side: native/lxl.{h,cpp}, built inside the Luxir tree).
+plugins {
+  id 'java-library'
+}
+
+group = 'org.luxir'
+version = '0.1.0-SNAPSHOT'
+
+java {
+  toolchain { languageVersion = JavaLanguageVersion.of(22) }
+}
+
+repositories { mavenCentral() }
+
+def luceneVersion = '10.4.0'
+def nativeLib = findProperty('luxir.lucene.library')
+    ?: "${projectDir}/../luxir/build/lux4j-release/bin/libluxir_lucene.so"
+
+dependencies {
+  api "org.apache.lucene:lucene-core:${luceneVersion}"
+  testImplementation "org.apache.lucene:lucene-test-framework:${luceneVersion}"
+  testImplementation "org.apache.lucene:lucene-analysis-common:${luceneVersion}"
+  testImplementation 'junit:junit:4.13.2'
+}
+
+tasks.withType(JavaCompile).configureEach {
+  options.encoding = 'UTF-8'
+  options.compilerArgs += ['-Xlint:all,-serial,-processing,-this-escape,-restricted', '-Werror']
+}
+
+test {
+  systemProperty 'luxir.lucene.library', nativeLib
+  jvmArgs '--enable-native-access=ALL-UNNAMED', '-ea', '-Xmx4g'
+  // Lucene's test framework reads these
+  systemProperty 'tests.seed', findProperty('tests.seed') ?: ''
+  if (findProperty('tests.seed') == null) systemProperties.remove('tests.seed')
+  systemProperty 'tests.multiplier', findProperty('tests.multiplier') ?: '1'
+  if (findProperty('tests.iters') != null) systemProperty 'tests.iters', findProperty('tests.iters')
+  maxHeapSize = '4g'
+  testLogging { exceptionFormat = 'full'; events 'failed' }
+}
+
+// HTTP benchmark of Solr cores: stock Lucene postings vs postingsFormat="Luxir".
+sourceSets {
+  bench {
+    java.srcDir 'src/bench/java'
+  }
+}
+dependencies {
+  benchImplementation "org.apache.lucene:lucene-core:${luceneVersion}"
+  benchImplementation "org.apache.lucene:lucene-analysis-common:${luceneVersion}"
+}
+tasks.register('solrBench', JavaExec) {
+  classpath = sourceSets.bench.runtimeClasspath
+  mainClass = 'org.luxir.lucene.bench.SolrHttpBench'
+  jvmArgs '-Xmx20g'
+  args((findProperty('solrBenchArgs') ?: '').toString().split(' ').findAll { it })
+}

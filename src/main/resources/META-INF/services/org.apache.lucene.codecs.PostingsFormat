@@ -1,0 +1,4 @@
+# Copyright 2026 Ishan Chattopadhyaya and luxir-lucene contributors
+# SPDX-License-Identifier: Apache-2.0
+
+org.luxir.lucene.codec.LuxirPostingsFormat
