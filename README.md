@@ -211,7 +211,7 @@ compare every response with stock Solr's on the same index.
 Requirements: Linux x86-64, the C++26 toolchain and dependencies that Luxir's
 build needs (see Luxir's `docs/dev/build-setup.md`), and JDK 22 or later.
 
-1. **Luxir with the patches.** Check out Luxir at `9bab98ea` (or later) and
+1. **Luxir with the patches.** Check out Luxir at `ad09e871` (or later) and
    apply the patches:
 
    ```bash
@@ -268,8 +268,8 @@ counts as Lucene's path over the same index.
 
 | | docs/s | server CPU-seconds | segments | merged to 1 segment |
 |---|---|---|---|---|
-| stock Solr | 81.4k, 78.9k | 1540, 1544 | 40, 37 | 106 s, 3.6 GB |
-| Solr + Luxir | 112.7k, 109.0k (1.38x) | 979, 1035 (0.65x) | 26, 27 | 155 s, 5.0 GB |
+| stock Solr | 84.7k, 89.0k | 1509, 1436 | 47, 46 | 102 s, 3.6 GB |
+| Solr + Luxir | 118.5k, 120.8k (1.38x) | 975, 951 (0.65x) | 27, 27 | 152 s, 5.0 GB |
 
 **Queries**, on the merged single-segment indexes: median latency from one
 client thread (rows=10, exact counts), and throughput from 8 client threads,
@@ -277,25 +277,25 @@ client thread (rows=10, exact counts), and throughput from 8 client threads,
 
 | category | requests | latency, stock (ms) | latency, Luxir (ms) | stock / Luxir | QPS, stock | QPS, Luxir | Luxir / stock |
 |---|---|---|---|---|---|---|---|
-| MatchAll | 1 | 0.60 | 0.53 | 1.14x | 19569 | 24563 | 1.26x |
-| StringTerm | 20 | 0.67 | 0.51 | 1.31x | 10473 | 21157 | 2.02x |
-| TextTerm | 30 | 0.49 | 0.42 | 1.15x | 14483 | 18654 | 1.29x |
-| TextPhrase | 30 | 0.52 | 0.50 | 1.05x | 12590 | 11645 | 0.92x |
-| TextOr | 20 | 0.84 | 0.62 | 1.36x | 6310 | 10540 | 1.67x |
-| TextAnd | 20 | 0.45 | 0.44 | 1.03x | 16927 | 16481 | 0.97x |
-| CatchAllText | 20 | 0.44 | 0.44 | 1.00x | 13780 | 17415 | 1.26x |
-| TextFiltered | 20 | 0.49 | 0.40 | 1.22x | 9508 | 13844 | 1.46x |
-| NumRange | 10 | 1.94 | 0.50 | 3.86x | 2082 | 6234 | 2.99x |
-| SortPopulation | 2 | 160.9 | 53.6 | 3.00x | 34 | 105 | 3.14x |
-| SortGeonameid | 2 | 136.2 | 53.2 | 2.56x | 40 | 105 | 2.62x |
-| TermSortPop | 10 | 0.56 | 0.79 | 0.71x | 6241 | 5231 | 0.84x |
-| CountryFacet | 9 | 62.3 | 38.4 | 1.62x | 72 | 121 | 1.67x |
-| HiCardFacet | 3 | 498.3 | 360.6 | 1.38x | 3 | 13 | 4.24x |
-| TermsPure | 5 | 77.3 | 63.5 | 1.22x | 72 | 78 | 1.08x |
-| TermsFiltered | 5 | 31.1 | 36.4 | 0.86x | 155 | 139 | 0.90x |
-| TermsProhibited | 5 | 75.5 | 65.1 | 1.16x | 73 | 76 | 1.04x |
-| **geomean** | | **5.11** | **3.77** | **1.36x** | **1029** | **1571** | **1.53x** |
-| **mixed, 30 s** | | | | | **189** | **433** | **2.30x** |
+| MatchAll | 1 | 0.67 | 0.51 | 1.32x | 20397 | 25906 | 1.27x |
+| StringTerm | 20 | 0.67 | 0.44 | 1.51x | 9728 | 21198 | 2.18x |
+| TextTerm | 30 | 0.46 | 0.42 | 1.11x | 13932 | 19513 | 1.40x |
+| TextPhrase | 30 | 0.49 | 0.50 | 0.97x | 12917 | 11981 | 0.93x |
+| TextOr | 20 | 0.89 | 0.62 | 1.44x | 6761 | 10821 | 1.60x |
+| TextAnd | 20 | 0.46 | 0.43 | 1.09x | 17462 | 17119 | 0.98x |
+| CatchAllText | 20 | 0.45 | 0.38 | 1.18x | 13427 | 17942 | 1.34x |
+| TextFiltered | 20 | 0.46 | 0.40 | 1.14x | 9789 | 13959 | 1.43x |
+| NumRange | 10 | 2.09 | 0.40 | 5.25x | 1267 | 7311 | 5.77x |
+| SortPopulation | 2 | 148.6 | 56.2 | 2.64x | 33 | 97 | 2.92x |
+| SortGeonameid | 2 | 129.5 | 56.5 | 2.29x | 40 | 97 | 2.44x |
+| TermSortPop | 10 | 0.57 | 0.68 | 0.84x | 6289 | 5491 | 0.87x |
+| CountryFacet | 9 | 63.3 | 38.4 | 1.65x | 71 | 120 | 1.70x |
+| HiCardFacet | 3 | 489.7 | 360.2 | 1.36x | 4 | 13 | 3.44x |
+| TermsPure | 5 | 77.8 | 63.0 | 1.24x | 72 | 78 | 1.09x |
+| TermsFiltered | 5 | 31.0 | 36.1 | 0.86x | 155 | 138 | 0.89x |
+| TermsProhibited | 5 | 75.9 | 64.4 | 1.18x | 73 | 77 | 1.05x |
+| **geomean** | | **5.11** | **3.63** | **1.41x** | **1013** | **1598** | **1.58x** |
+| **mixed, 30 s** | | | | | **199** | **435** | **2.18x** |
 
 Single-thread latency ratios move by about 10% between runs, mostly in the
 sub-millisecond categories. Slower than stock: a term query sorted by a field

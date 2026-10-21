@@ -1,4 +1,4 @@
-From 36d68ba844f9c7f5f7e70122899a6e00c7eff307 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@apache.org>
 Date: Tue, 20 Oct 2026 19:36:48 +0530
 Subject: [PATCH 2/3] query: skip term windows without docs when counting

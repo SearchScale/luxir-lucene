@@ -1139,20 +1139,19 @@ public:
 
 
     // NumericPredicateQuery::Weight's cost estimate from block relations
-    static int64_t estimateCost(IntColReader& reader, std::span<const NumericPredicateQuery::BlockPlan> plans) {
+    static int64_t estimateCost(IntColReader& reader, std::span<const NumericPredicateQuery::BlockPlan> plans,
+                                bool exactSet) {
       int64_t estimate = 0;
       for (int64_t b = 0; b < reader.numBlocks(); b++) {
-        int64_t count = reader.valuesInBlock(b);
-        switch (plans[(size_t)b].relation) {
-          case NumericPredicateQuery::BlockRelation::INSIDE:
-            estimate += count;
-            break;
-          case NumericPredicateQuery::BlockRelation::CROSSES:
-            estimate += (count + 1) / 2;
-            break;
-          case NumericPredicateQuery::BlockRelation::OUTSIDE:
-            break;
-        }
+        plans[(size_t)b].forEachRun((uint32_t)reader.valuesInBlock(b),
+                                    [&](NumericPredicateQuery::BlockRelation relation, uint32_t begin, uint32_t end) {
+                                      int64_t count = end - begin;
+                                      if (relation == NumericPredicateQuery::BlockRelation::INSIDE) {
+                                        estimate += count;
+                                      } else if (relation == NumericPredicateQuery::BlockRelation::CROSSES) {
+                                        estimate += exactSet ? count : (count + 1) / 2;
+                                      }
+                                    });
       }
       return std::min<int64_t>(estimate, reader.docsWithValue());
     }
@@ -1179,12 +1178,9 @@ public:
       int64_t colMin = reader->getMin(), colMax = reader->getMax();
       auto& pred = query.predicate;
       if (colMax < pred.getLo() || pred.getHi() < colMin) return nullptr;
-      auto plans = targetPool.make_span<NumericPredicateQuery::BlockPlan>((size_t)reader->numBlocks());
-      for (int64_t i = 0; i < reader->numBlocks(); i++) {
-        plans[(size_t)i] = pred.classifyBlock(reader->blockInfo(i), reader->blockZone(i));
-      }
+      std::span<NumericPredicateQuery::BlockPlan> plans;  // the supplier classifies on demand when points answer
       bool allMatch = pred.covers(colMin, colMax);
-      int64_t cost = estimateCost(*reader, plans);
+      int64_t cost = 0;
       PointsReader* points = e->points;
       std::span<const PointsReader::OrdinalRange> pointRanges;
       uint64_t pointValueCount = 0;
@@ -1207,11 +1203,10 @@ public:
         matchState = pointValueCount == 0 ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
       } else {
         points = nullptr;
-        bool hasInside = false, hasCrosses = false;
-        for (const auto& plan : plans) {
-          hasInside |= plan.relation == NumericPredicateQuery::BlockRelation::INSIDE;
-          hasCrosses |= plan.relation == NumericPredicateQuery::BlockRelation::CROSSES;
-        }
+        plans = NumericPredicateQuery::classifyBlocks(targetPool, *reader, pred);
+        cost = estimateCost(*reader, plans, pred.isExactSet());
+        bool hasInside = NumericPredicateQuery::hasInsideRun(*reader, plans), hasCrosses = false;
+        for (const auto& plan : plans) hasCrosses |= plan.relation == NumericPredicateQuery::BlockRelation::CROSSES;
         matchState = hasInside ? Query::MatchState::NONEMPTY
                      : hasCrosses ? Query::MatchState::UNKNOWN
                                   : Query::MatchState::EMPTY;
@@ -2440,8 +2435,8 @@ int32_t lxl_writer_stored_merge(lxl_writer* w, int32_t n, lxl_reader* const* sou
     for (int32_t i = 0; i < n; i++) {
       if (sources[i] == nullptr) continue;  // nothing stored: the writer pads its docs
       PostingsReader& pr = *sources[i]->postings;
-      auto info = findField(pr, Postings::STORED_DEFAULT_RESOURCE);
-      if (!info) continue;
+      const PostingsReader::Field* info = pr.fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+      if (info == nullptr) continue;
       StoredFieldsReader in(pr, *info);
       // source field (by local id) -> target name; identity when the caller's ids are unchanged
       auto names = in.fieldNames();
@@ -2462,11 +2457,12 @@ int32_t lxl_writer_stored_merge(lxl_writer* w, int32_t n, lxl_reader* const* sou
       }
       // Verbatim chunk copy: no deletions maps every doc to base + doc, and compressed
       // chunks are position-independent, so they are appended without decompression.
-      if (doc_maps[i] == nullptr && identity && out.adoptFieldTable(names)) {
+      if (doc_maps[i] == nullptr && identity && out.canCopyChunks(in.format(), in.dictionary())
+          && !StoredFieldsWriter::tooDirty(in.numChunks(), in.numDirtyChunks()) && out.adoptFieldTable(names)) {
         out.alignForRawAppend(bases[i]);
         in.readChunkDirectory(firstDocs, offsets);
         out.appendRawChunkRegion(bases[i], in.chunkRegionPtr(), in.chunkRegionBytes(), firstDocs, offsets,
-                                 in.maxDoc(), in.maxChunkBytes());
+                                 in.maxDoc(), in.maxChunkBytes(), in.numDirtyChunks());
         raw++;
         continue;
       }
@@ -2513,8 +2509,8 @@ int32_t lxl_dict_lookup(lxl_dict* d, int64_t ord, uint8_t* out, int32_t cap) {
 
 lxl_stored* lxl_stored_new(lxl_reader* r) {
   return guardedPtr<lxl_stored>([&]() -> lxl_stored* {
-    auto info = findField(*r->postings, Postings::STORED_DEFAULT_RESOURCE);
-    if (!info) throw std::runtime_error("lxl: no stored values in this segment");
+    const PostingsReader::Field* info = r->postings->fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+    if (info == nullptr) throw std::runtime_error("lxl: no stored values in this segment");
     auto s = std::make_unique<lxl_stored>();
     s->sf = std::make_unique<StoredFieldsReader>(*r->postings, *info);
     for (auto name : s->sf->fieldNames()) {

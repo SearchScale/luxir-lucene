@@ -35,6 +35,8 @@ tasks.withType(JavaCompile).configureEach {
 
 test {
   systemProperty 'luxir.lucene.library', nativeLib
+  // a rebuilt library reruns the tests
+  inputs.file(nativeLib).optional().withPropertyName('nativeLib')
   jvmArgs '--enable-native-access=ALL-UNNAMED', '-ea', '-Xmx4g'
   // Lucene's test framework reads these
   systemProperty 'tests.seed', findProperty('tests.seed') ?: ''
