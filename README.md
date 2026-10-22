@@ -211,7 +211,7 @@ compare every response with stock Solr's on the same index.
 Requirements: Linux x86-64, the C++26 toolchain and dependencies that Luxir's
 build needs (see Luxir's `docs/dev/build-setup.md`), and JDK 22 or later.
 
-1. **Luxir with the patches.** Check out Luxir at `ad09e871` (or later) and
+1. **Luxir with the patches.** Check out Luxir at `e42cd268` (or later) and
    apply the patches:
 
    ```bash
@@ -268,8 +268,11 @@ counts as Lucene's path over the same index.
 
 | | docs/s | server CPU-seconds | segments | merged to 1 segment |
 |---|---|---|---|---|
-| stock Solr | 84.7k, 89.0k | 1509, 1436 | 47, 46 | 102 s, 3.6 GB |
-| Solr + Luxir | 118.5k, 120.8k (1.38x) | 975, 951 (0.65x) | 27, 27 | 152 s, 5.0 GB |
+| stock Solr | 79.2k, 83.5k | 1528, 1489 | 46, 44 | 101 s, 3.6 GB |
+| Solr + Luxir | 120.2k, 95.4k* (1.33x) | 967, 949 (0.64x) | 26, 27 | 139 s, 5.0 GB |
+
+\* That round's commit took 35.9 s instead of the usual 9 s (SATA disk); its add
+phase was 83.6 s, as in round 1. Without the commit, both rounds are about 1.5x.
 
 **Queries**, on the merged single-segment indexes: median latency from one
 client thread (rows=10, exact counts), and throughput from 8 client threads,
@@ -277,25 +280,25 @@ client thread (rows=10, exact counts), and throughput from 8 client threads,
 
 | category | requests | latency, stock (ms) | latency, Luxir (ms) | stock / Luxir | QPS, stock | QPS, Luxir | Luxir / stock |
 |---|---|---|---|---|---|---|---|
-| MatchAll | 1 | 0.67 | 0.51 | 1.32x | 20397 | 25906 | 1.27x |
-| StringTerm | 20 | 0.67 | 0.44 | 1.51x | 9728 | 21198 | 2.18x |
-| TextTerm | 30 | 0.46 | 0.42 | 1.11x | 13932 | 19513 | 1.40x |
-| TextPhrase | 30 | 0.49 | 0.50 | 0.97x | 12917 | 11981 | 0.93x |
-| TextOr | 20 | 0.89 | 0.62 | 1.44x | 6761 | 10821 | 1.60x |
-| TextAnd | 20 | 0.46 | 0.43 | 1.09x | 17462 | 17119 | 0.98x |
-| CatchAllText | 20 | 0.45 | 0.38 | 1.18x | 13427 | 17942 | 1.34x |
-| TextFiltered | 20 | 0.46 | 0.40 | 1.14x | 9789 | 13959 | 1.43x |
-| NumRange | 10 | 2.09 | 0.40 | 5.25x | 1267 | 7311 | 5.77x |
-| SortPopulation | 2 | 148.6 | 56.2 | 2.64x | 33 | 97 | 2.92x |
-| SortGeonameid | 2 | 129.5 | 56.5 | 2.29x | 40 | 97 | 2.44x |
-| TermSortPop | 10 | 0.57 | 0.68 | 0.84x | 6289 | 5491 | 0.87x |
-| CountryFacet | 9 | 63.3 | 38.4 | 1.65x | 71 | 120 | 1.70x |
-| HiCardFacet | 3 | 489.7 | 360.2 | 1.36x | 4 | 13 | 3.44x |
-| TermsPure | 5 | 77.8 | 63.0 | 1.24x | 72 | 78 | 1.09x |
-| TermsFiltered | 5 | 31.0 | 36.1 | 0.86x | 155 | 138 | 0.89x |
-| TermsProhibited | 5 | 75.9 | 64.4 | 1.18x | 73 | 77 | 1.05x |
-| **geomean** | | **5.11** | **3.63** | **1.41x** | **1013** | **1598** | **1.58x** |
-| **mixed, 30 s** | | | | | **199** | **435** | **2.18x** |
+| MatchAll | 1 | 0.69 | 0.53 | 1.31x | 20855 | 25809 | 1.24x |
+| StringTerm | 20 | 0.67 | 0.47 | 1.42x | 10301 | 21846 | 2.12x |
+| TextTerm | 30 | 0.57 | 0.45 | 1.29x | 15030 | 19939 | 1.33x |
+| TextPhrase | 30 | 0.47 | 0.39 | 1.20x | 13079 | 12108 | 0.93x |
+| TextOr | 20 | 0.89 | 0.62 | 1.43x | 6831 | 11096 | 1.62x |
+| TextAnd | 20 | 0.49 | 0.40 | 1.21x | 17955 | 17539 | 0.98x |
+| CatchAllText | 20 | 0.43 | 0.36 | 1.18x | 14273 | 18286 | 1.28x |
+| TextFiltered | 20 | 0.45 | 0.39 | 1.15x | 9568 | 14061 | 1.47x |
+| NumRange | 10 | 1.93 | 0.41 | 4.65x | 1946 | 8122 | 4.17x |
+| SortPopulation | 2 | 147.9 | 56.5 | 2.62x | 33 | 101 | 3.04x |
+| SortGeonameid | 2 | 128.8 | 56.6 | 2.27x | 40 | 101 | 2.54x |
+| TermSortPop | 10 | 0.60 | 0.64 | 0.94x | 6426 | 5664 | 0.88x |
+| CountryFacet | 9 | 65.1 | 38.1 | 1.71x | 69 | 121 | 1.76x |
+| HiCardFacet | 3 | 517.7 | 347.9 | 1.49x | 5 | 13 | 2.35x |
+| TermsPure | 5 | 77.2 | 62.4 | 1.24x | 72 | 79 | 1.09x |
+| TermsFiltered | 5 | 30.5 | 36.0 | 0.85x | 156 | 139 | 0.89x |
+| TermsProhibited | 5 | 75.9 | 64.6 | 1.17x | 73 | 77 | 1.05x |
+| **geomean** | | **5.18** | **3.57** | **1.45x** | **1079** | **1634** | **1.51x** |
+| **mixed, 30 s** | | | | | **251** | **435** | **1.73x** |
 
 Single-thread latency ratios move by about 10% between runs, mostly in the
 sub-millisecond categories. Slower than stock: a term query sorted by a field
