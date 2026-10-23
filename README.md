@@ -215,7 +215,7 @@ compare every response with stock Solr's on the same index.
 Requirements: Linux x86-64, the C++26 toolchain and dependencies that Luxir's
 build needs (see Luxir's `docs/dev/build-setup.md`), and JDK 22 or later.
 
-1. **Luxir with the patches.** Check out Luxir at `e42cd268` (or later) and
+1. **Luxir with the patches.** Check out Luxir at `8cb622ba` (or later) and
    apply the patches:
 
    ```bash

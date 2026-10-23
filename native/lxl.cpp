@@ -1860,7 +1860,7 @@ void lxl_analyzer_free(lxl_analyzer* a) { delete a; }
 int32_t lxl_analyze_start(lxl_analyzer* a, const uint8_t* text, int32_t len) {
   return guarded([&] {
     a->value.assign((const char*)text, (size_t)len);
-    a->chain->head.setValue(a->value);
+    a->chain->setValue(a->value);  // through the chain: it applies any character filters
     a->chain->reset();
     a->active = true;
     return 0;
@@ -1871,7 +1871,7 @@ int32_t lxl_analyze_next(lxl_analyzer* a, uint8_t* terms, int32_t* meta, int32_t
   return guarded([&] {
     if (!a->active) return 0;
     TokenStream& tail = *a->chain->tail;
-    Token& tok = a->chain->head.getToken();
+    Token& tok = a->chain->getToken();
     int32_t n = 0;
     size_t used = 0;
     while (n < max_tokens) {

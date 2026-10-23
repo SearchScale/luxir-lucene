@@ -1,7 +1,8 @@
-From 48a10abe1434134f571861bdcfd9b6e29d2dfd7d Mon Sep 17 00:00:00 2001
+From 13c80eccb21363027469ee57cebc1a7faacfe187 Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@searchscale.com>
 Date: Fri, 23 Oct 2026 22:24:38 +0530
-Subject: [PATCH] query: answer sparse range verification from block relations
+Subject: [PATCH 4/4] query: answer sparse range verification from block
+ relations
 
 A numeric range verified per candidate behind a selective lead read every
 candidate's value. Classify each block against the range the first time a
@@ -13,7 +14,7 @@ read. Values that cluster by doc (time-ordered data) leave few of them.
  1 file changed, 22 insertions(+), 3 deletions(-)
 
 diff --git a/src/luxir/query/NumericPredicateQuery.h b/src/luxir/query/NumericPredicateQuery.h
-index 4cd00a60..19b90017 100644
+index e51c017d..1bea6598 100644
 --- a/src/luxir/query/NumericPredicateQuery.h
 +++ b/src/luxir/query/NumericPredicateQuery.h
 @@ -193,6 +193,11 @@ public:

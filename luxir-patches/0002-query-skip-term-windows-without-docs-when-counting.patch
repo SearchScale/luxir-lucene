@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 0acad4f87a946511834e0411ae0a633fee6a1dc8 Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@apache.org>
 Date: Tue, 20 Oct 2026 19:36:48 +0530
-Subject: [PATCH 2/3] query: skip term windows without docs when counting
+Subject: [PATCH 2/4] query: skip term windows without docs when counting
 
 Without a window filter, TermBulkScorer's count and match windows now
 start at the window holding the term's next doc instead of stepping
@@ -12,10 +12,10 @@ longer walks thousands of windows that hold none of its docs.
  1 file changed, 23 insertions(+)
 
 diff --git a/src/luxir/query/TermQuery.h b/src/luxir/query/TermQuery.h
-index 380fcaa9..e6165474 100644
+index 4633736a..26b7ba02 100644
 --- a/src/luxir/query/TermQuery.h
 +++ b/src/luxir/query/TermQuery.h
-@@ -1299,6 +1299,20 @@ public:
+@@ -1249,6 +1249,20 @@ public:
        }
      }
  
@@ -36,7 +36,7 @@ index 380fcaa9..e6165474 100644
    public:
      TermBulkScorer(MemPool& pool, TermQuery::Scorer* scorer, int32_t maxDoc)
          : scorer(scorer),
-@@ -1350,6 +1364,10 @@ public:
+@@ -1300,6 +1314,10 @@ public:
        if (filter != nullptr && filter->card() == 0) {
          return PostingsReader::END;
        }
@@ -47,7 +47,7 @@ index 380fcaa9..e6165474 100644
  
        setWindowBounds(min, max);
        if (!fillFilteredWindowBits(filter)) {
-@@ -1388,6 +1406,11 @@ public:
+@@ -1338,6 +1356,11 @@ public:
        if (filter != nullptr && filter->card() == 0) {
          return PostingsReader::END;
        }
@@ -60,5 +60,5 @@ index 380fcaa9..e6165474 100644
        setWindowBounds(min, max);
        out.min = windowStart;
 -- 
-2.56.0
+2.34.1
 
