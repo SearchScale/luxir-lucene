@@ -115,19 +115,38 @@ public final class LuxirSearch {
     Query rewritten = searcher.rewrite(withFilters(query, filters));
     IndexReader top = searcher.getIndexReader();
     if (rewritten instanceof MatchNoDocsQuery) return new Run(new int[0], new float[0], 0, true, null, null);
-    LxlQuery.Encoded enc = LxlQuery.encode(rewritten, searcher, 1f, true, true, true);
+    // the filter also as a FILTER clause, so Luxir's planner sees its cost and can lead with it
+    Query planned = filter == null ? rewritten : new BooleanQuery.Builder()
+        .add(rewritten, BooleanClause.Occur.MUST)
+        .add(FilterSlotQuery.INSTANCE, BooleanClause.Occur.FILTER)
+        .build();
+    LxlQuery.Encoded enc = LxlQuery.encode(planned, searcher, 1f, true, true, true);
     if (enc == null) return null;
     NativeMulti multi = NativeMulti.of(top);
     if (multi == null || !nativeLeaves(multi, top, enc)) return null;
     List<LeafReaderContext> leaves = top.leaves();
     int n = multi.leafOfSeg.length;
     {
+      // per segment: live docs and the filter, as the native call's live words and as the filter slot
+      NativeLeaf.Words[] liveWords = new NativeLeaf.Words[n];
+      for (int s = 0; s < n; s++) {
+        LeafReaderContext ctx = leaves.get(multi.leafOfSeg[s]);
+        liveWords[s] = filter != null && filterCached
+            ? NativeLeaf.cachedLiveAndFilter(ctx, filter, leaves.size())
+            : NativeLeaf.liveAndFilter(ctx.reader().getLiveDocs(), filter, ctx.docBase, ctx.reader().maxDoc(), arena);
+      }
       int numSlots = enc.ranges().size();
       MemorySegment slotBits = arena.allocate(ValueLayout.ADDRESS, Math.max(1, (long) numSlots * n));
       MemorySegment slotCounts = arena.allocate(ValueLayout.JAVA_INT, Math.max(1, (long) numSlots * n));
       for (int sl = 0; sl < numSlots; sl++) {
         LxlQuery.Range range = enc.ranges().get(sl);
         for (int s = 0; s < n; s++) {
+          if (range.isFilter()) {
+            NativeLeaf.Words w = liveWords[s];
+            slotBits.setAtIndex(ValueLayout.ADDRESS, (long) sl * n + s, w.words());
+            slotCounts.setAtIndex(ValueLayout.JAVA_INT, (long) sl * n + s, w.count());
+            continue;
+          }
           LeafReader leaf = leaves.get(multi.leafOfSeg[s]).reader();
           MemorySegment points = NativeLeaf.nativePoints(leaf, range.field());
           if (points == null) return null; // points not in Luxir format: Lucene evaluates the range
@@ -182,9 +201,7 @@ public final class LuxirSearch {
       for (int s = 0; s < n; s++) {
         LeafReaderContext ctx = leaves.get(multi.leafOfSeg[s]);
         int leafMax = ctx.reader().maxDoc();
-        NativeLeaf.Words w = filter != null && filterCached
-            ? NativeLeaf.cachedLiveAndFilter(ctx, filter, leaves.size())
-            : NativeLeaf.liveAndFilter(ctx.reader().getLiveDocs(), filter, ctx.docBase, leafMax, arena);
+        NativeLeaf.Words w = liveWords[s];
         live.setAtIndex(ValueLayout.ADDRESS, s, w == null ? MemorySegment.NULL : w.words());
         numLive.setAtIndex(ValueLayout.JAVA_INT, s, w == null ? leafMax : w.count());
         if (wantSegBits) {
@@ -371,6 +388,7 @@ public final class LuxirSearch {
         return false;
       }
       for (LxlQuery.Range range : enc.ranges()) {
+        if (range.isFilter()) continue; // the caller's bits
         if (NativeLeaf.nativePoints(ctx.reader(), range.field()) == null) return false;
       }
       for (LxlQuery.ColumnRange col : enc.columns()) {
@@ -453,16 +471,24 @@ public final class LuxirSearch {
   }
 
   // ORs a segment's match words into the index-wide set at docBase, a word at a time.
-  private static void orInto(FixedBitSet global, MemorySegment leafBits, int docBase, int leafMax) {
+  static void orInto(FixedBitSet global, MemorySegment leafBits, int docBase, int leafMax) {
     long[] g = global.getBits();
     int shift = docBase & 63;
     int base = docBase >>> 6;
     int nwords = FixedBitSet.bits2words(leafMax);
-    for (int w = 0; w < nwords; w++) {
-      long word = leafBits.getAtIndex(ValueLayout.JAVA_LONG, w);
-      if (word == 0) continue;
-      g[base + w] |= word << shift;
-      if (shift != 0 && base + w + 1 < g.length) g[base + w + 1] |= word >>> (64 - shift);
+    // bulk copies in chunks: per-word segment access is slow until the JIT has compiled it
+    long[] chunk = NativeLeaf.scratch(0);
+    for (int start = 0; start < nwords; start += chunk.length) {
+      int len = Math.min(chunk.length, nwords - start);
+      MemorySegment.copy(leafBits, ValueLayout.JAVA_LONG, (long) start * Long.BYTES, chunk, 0, len);
+      for (int i = 0; i < len; i++) {
+        long word = chunk[i];
+        if (word == 0) continue;
+        int w = start + i;
+        g[base + w] |= word << shift;
+        if (shift != 0 && base + w + 1 < g.length) g[base + w + 1] |= word >>> (64 - shift);
+      }
     }
   }
+
 }

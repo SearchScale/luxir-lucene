@@ -1760,7 +1760,42 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
 
     int32_t got = 0;
     int64_t ranked = 0;
-    if (k > 0 && count != 0) {
+    bool rankedFromBits = false;
+    if (k > 0 && count > 0 && match_bits != nullptr) {
+      // A constant-score query's top k are its first k matches by (segment, doc), the order
+      // TopDocsCollector breaks score ties in: read them from the counting pass's bits instead
+      // of running the query again. One scorer, planned for a single doc, supplies the score.
+      auto* w = prepared.weight(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+      if (w->isConstantScoring()) {
+        float score = 0;
+        bool scored = false;
+        for (size_t i = 0; i < n && got < k; i++) {
+          if (match_bits[i] == nullptr) continue;
+          Segment& seg = segments[i];
+          size_t words = ((size_t)seg.maxDoc() + 63) / 64;
+          for (size_t wi = 0; wi < words && got < k; wi++) {
+            for (uint64_t word = match_bits[i][wi]; word != 0 && got < k; word &= word - 1) {
+              int32_t d = (int32_t)(wi * 64 + (size_t)std::countr_zero(word));
+              if (!scored) {
+                auto* supplier = w->scorerSupplier(prepared.pool, seg);
+                auto* s = supplier == nullptr ? nullptr
+                    : supplier->resolve(prepared.pool, supplier->makePlanContext(Query::Demand::fromLeadCost(1)))
+                          ->build(prepared.pool);
+                if (s == nullptr || s->advance(d) != d) throw std::logic_error("lxl: counted match not found");
+                score = s->score();
+                scored = true;
+              }
+              segs[got] = (int32_t)i;
+              docs[got] = d;
+              scores[got] = score;
+              got++;
+            }
+          }
+        }
+        rankedFromBits = true;
+      }
+    }
+    if (!rankedFromBits && k > 0 && count != 0) {
       auto* w = prepared.weight(Query::NEED_SCORES | Query::ALLOW_PRUNING);
       TopDocsCollector collector(k);
       MaxScoreAccumulator accumulator;
@@ -2846,6 +2881,125 @@ int32_t lxl_column_ord_counts_sparse(lxl_reader* r, const char* name, int32_t na
 
 namespace {
 
+// A sorted dictionary read in place: term ord's bytes are [ends(ord - 1), ends(ord)).
+struct JoinDict {
+  const char* bytes = nullptr;
+  std::optional<MonoReader> ends;
+  int64_t count = 0;
+
+  JoinDict(lxl_reader* r, const char* name) {
+    auto info = findField(*r->postings, std::string_view(name));
+    if (!info) throw std::runtime_error("lxl: no such dictionary");
+    count = info->numValues;
+    bytes = r->postings->getInputStreamSeek(info->columnLoc).ptr();
+    ends.emplace(*r->postings, info->monoLoc, info->monoMetaOff, info->numValues);
+  }
+
+  std::string_view term(int64_t ord) const {
+    auto [start, end] = ends->valuesAt(ord);
+    return std::string_view(bytes + start, (size_t)(end - start));
+  }
+};
+
+// Every doc of max_doc, as match words for forEachMatch.
+const uint64_t* allDocs(int32_t max_doc) {
+  thread_local std::vector<uint64_t> tlAll;
+  size_t words = FixedBitSet::sizeInWords(max_doc);
+  if (tlAll.size() < words) tlAll.assign(words, ~0ULL);
+  return tlAll.data();
+}
+
+}  // namespace
+
+int32_t lxl_join_sorted(int32_t n, lxl_reader* const* stores, const int32_t* max_docs,
+                        const char* const* from_cols, const char* const* from_dicts,
+                        const uint64_t* const* from_matches, const int32_t* from_counts,
+                        const char* const* to_cols, const char* const* to_dicts,
+                        const uint64_t* const* to_live, uint64_t* const* out, int64_t* total) {
+  return guarded([&]() -> int32_t {
+    *total = 0;
+    // 1. the from docs' values, as terms (byte order, as the dictionaries sort them)
+    std::vector<std::string_view> terms;
+    std::vector<uint64_t> seen;
+    for (int32_t i = 0; i < n; i++) {
+      if (stores[i] == nullptr || from_cols[i] == nullptr || from_matches[i] == nullptr || from_counts[i] == 0) continue;
+      JoinDict dict(stores[i], from_dicts[i]);
+      seen.assign(FixedBitSet::sizeInWords((int32_t)std::min<int64_t>(dict.count, INT32_MAX)) + 1, 0);
+      scanColumn(stores[i], from_cols[i], (int32_t)std::strlen(from_cols[i]), from_matches[i], from_counts[i],
+                 max_docs[i], [&](int32_t, std::span<const int64_t> v) {
+                   for (int64_t ord : v) {
+                     if (ord < 0 || ord >= dict.count) throw std::invalid_argument("lxl: ordinal out of range");
+                     uint64_t bit = 1ULL << (ord & 63);
+                     if ((seen[(size_t)ord >> 6] & bit) == 0) {
+                       seen[(size_t)ord >> 6] |= bit;
+                       terms.push_back(dict.term(ord));
+                     }
+                   }
+                 });
+    }
+    if (terms.empty()) return 0;
+    std::sort(terms.begin(), terms.end());
+    terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
+
+    // 2. per segment: those terms' ords in its to-dictionary, then every doc whose value is one
+    std::vector<uint64_t> ords;
+    for (int32_t i = 0; i < n; i++) {
+      if (stores[i] == nullptr || to_cols[i] == nullptr) continue;
+      JoinDict dict(stores[i], to_dicts[i]);
+      if (dict.count == 0) continue;
+      ords.assign(FixedBitSet::sizeInWords((int32_t)std::min<int64_t>(dict.count, INT32_MAX)) + 1, 0);
+      bool any = false;
+      double log2Count = std::log2((double)dict.count + 1);
+      if ((double)terms.size() * log2Count < (double)dict.count) {
+        // few terms: binary search each
+        for (std::string_view t : terms) {
+          int64_t lo = 0, hi = dict.count;
+          while (lo < hi) {
+            int64_t mid = lo + (hi - lo) / 2;
+            if (dict.term(mid) < t) lo = mid + 1;
+            else hi = mid;
+          }
+          if (lo < dict.count && dict.term(lo) == t) {
+            ords[(size_t)lo >> 6] |= 1ULL << (lo & 63);
+            any = true;
+          }
+        }
+      } else {
+        // many terms: one merge walk over the dictionary
+        size_t ti = 0;
+        for (int64_t o = 0; o < dict.count && ti < terms.size(); o++) {
+          std::string_view d = dict.term(o);
+          while (ti < terms.size() && terms[ti] < d) ti++;
+          if (ti < terms.size() && terms[ti] == d) {
+            ords[(size_t)o >> 6] |= 1ULL << (o & 63);
+            any = true;
+            ti++;
+          }
+        }
+      }
+      if (!any) continue;
+      const uint64_t* live = to_live[i] != nullptr ? to_live[i] : allDocs(max_docs[i]);
+      int32_t numLive = to_live[i] != nullptr ? popcount(live, max_docs[i]) : max_docs[i];
+      uint64_t* o = out[i];
+      int64_t found = 0;
+      scanColumn(stores[i], to_cols[i], (int32_t)std::strlen(to_cols[i]), live, numLive, max_docs[i],
+                 [&](int32_t d, std::span<const int64_t> v) {
+                   for (int64_t ord : v) {
+                     if (ord >= 0 && ord < dict.count && (ords[(size_t)ord >> 6] >> (ord & 63) & 1)) {
+                       o[(size_t)d >> 6] |= 1ULL << (d & 63);
+                       found++;
+                       return;
+                     }
+                   }
+                 });
+      *total += found;
+    }
+    return 0;
+  });
+}
+
+namespace {
+
 // One value of lxl_column_value_counts (layout shared with the Java side).
 struct ValueCount {
   int64_t value;
@@ -3422,9 +3576,24 @@ int32_t lxl_facet_collect(lxl_reader* r, const uint64_t* matches, int32_t num_ma
         });
       }
     } else if (group == GROUP_RANGES) {
+      // Disjoint ranges in ascending order (a range facet's buckets): a single value's range is the
+      // last one starting at or below it, found by binary search instead of testing every range.
+      bool ascending = n_ranges > 0;
+      for (int32_t i = 0; i < n_ranges && ascending; i++) {
+        ascending = los[i] <= his[i] && (i == 0 || his[i - 1] < los[i]);
+      }
       if (findField(*r->postings, std::string_view(gname, (size_t)gname_len))) {
         scanColumn(r, gname, gname_len, matches, num_matches, max_doc, [&](int32_t d, std::span<const int64_t> v) {
           if (v.empty()) return;
+          if (ascending && v.size() == 1) {
+            int64_t key = sortKey(range_kind, v[0]);
+            const int64_t* after = std::upper_bound(los, los + n_ranges, key);
+            if (after != los) {
+              int32_t i = (int32_t)(after - los) - 1;
+              if (key <= his[i]) add(d, i);
+            }
+            return;
+          }
           for (int32_t i = 0; i < n_ranges; i++) {
             for (int64_t x : v) {
               int64_t key = sortKey(range_kind, x);

@@ -158,6 +158,10 @@ The Solr module (`solr/modules/luxir-codec` on the Solr branch) provides:
   **`LuxirFacetModule`** (JSON facets: terms, ranges, query facets and stats
   collected natively through Solr's `FacetAccelerator` hook, results
   bit-identical to Java's);
+- **`LuxirJoinQParserPlugin`** (registered as `join`): same-core joins between
+  single-valued string fields, computed natively over the fields' doc-values
+  columns and dictionaries (no terms or postings iteration); other joins go to
+  Solr's join unchanged;
 - **`LuxirUpdateRequestHandler`**: a JSON loader that parses flat documents
   straight from the request bytes and, where the update chain allows it, builds
   Lucene documents without a `SolrInputDocument`;

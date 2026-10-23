@@ -202,22 +202,38 @@ final class NativeLeaf {
     int shift = docBase & 63;
     int first = docBase >>> 6;
     int count = 0;
-    for (int w = 0; w < nwords; w++) {
-      int i = first + w;
-      long lo = i < fb.length ? fb[i] : 0;
-      long word;
-      if (shift == 0) {
-        word = lo;
-      } else {
-        long hi = i + 1 < fb.length ? fb[i + 1] : 0;
-        word = (lo >>> shift) | (hi << (64 - shift));
+    // built in Java chunks and bulk-copied: per-word segment access is slow until JIT-compiled
+    long[] out = scratch(0);
+    long[] liveChunk = scratch(1);
+    for (int start = 0; start < nwords; start += out.length) {
+      int len = Math.min(out.length, nwords - start);
+      if (lw != null) MemorySegment.copy(lw.words(), ValueLayout.JAVA_LONG, (long) start * Long.BYTES, liveChunk, 0, len);
+      for (int j = 0; j < len; j++) {
+        int w = start + j;
+        int i = first + w;
+        long lo = i < fb.length ? fb[i] : 0;
+        long word;
+        if (shift == 0) {
+          word = lo;
+        } else {
+          long hi = i + 1 < fb.length ? fb[i + 1] : 0;
+          word = (lo >>> shift) | (hi << (64 - shift));
+        }
+        int rem = maxDoc - (w << 6);
+        if (rem < 64) word &= (1L << rem) - 1;
+        if (lw != null) word &= liveChunk[j];
+        out[j] = word;
+        count += Long.bitCount(word);
       }
-      int rem = maxDoc - (w << 6);
-      if (rem < 64) word &= (1L << rem) - 1;
-      if (lw != null) word &= lw.words().getAtIndex(ValueLayout.JAVA_LONG, w);
-      seg.setAtIndex(ValueLayout.JAVA_LONG, w, word);
-      count += Long.bitCount(word);
+      MemorySegment.copy(out, 0, seg, ValueLayout.JAVA_LONG, (long) start * Long.BYTES, len);
     }
     return new Words(seg, count);
+  }
+
+  private static final ThreadLocal<long[][]> SCRATCH = ThreadLocal.withInitial(() -> new long[2][4096]);
+
+  /** One of the calling thread's two scratch word arrays (for chunked copies; not reentrant). */
+  static long[] scratch(int which) {
+    return SCRATCH.get()[which];
   }
 }

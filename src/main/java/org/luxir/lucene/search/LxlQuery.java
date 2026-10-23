@@ -88,8 +88,15 @@ public final class LxlQuery {
    * with {@code values}, exactly those points (a point set).
    */
   public record Range(String field, long lo, long hi, long[] values) {
+    /** The caller's filter as a bitset clause ({@link FilterSlotQuery}): its bits are the filter's. */
+    static final Range FILTER = new Range(null, 0, -1, null);
+
     Range(String field, long lo, long hi) {
       this(field, lo, hi, null);
+    }
+
+    boolean isFilter() {
+      return this == FILTER;
     }
   }
 
@@ -323,6 +330,15 @@ public final class LxlQuery {
         }
       }
       return node(iodv.getIndexQuery()); // same matches and constant score
+    }
+    if (q instanceof FilterSlotQuery) {
+      if (!allowRanges) return false;
+      ranges.add(Range.FILTER);
+      fieldless = true;
+      body.write(9);
+      i32(ranges.size() - 1);
+      f32(0f); // a FILTER clause: never scored
+      return true;
     }
     if (q instanceof PointRangeQuery pr) {
       if (!allowRanges || pr.getNumDims() != 1 || pr.getBytesPerDim() > Long.BYTES) return false;

@@ -251,6 +251,10 @@ public final class LxlNative {
   // one search over many segments
   public static final MethodHandle MULTI_NEW = fn("lxl_multi_new", FunctionDescriptor.of(ADDRESS, JAVA_INT, ADDRESS));
   public static final MethodHandle MULTI_FREE = fn("lxl_multi_free", FunctionDescriptor.ofVoid(ADDRESS));
+  public static final MethodHandle JOIN_SORTED =
+      fn("lxl_join_sorted",
+          FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
+              ADDRESS, ADDRESS, ADDRESS, ADDRESS));
   public static final MethodHandle MULTI_TOP_K =
       fn("lxl_multi_top_k",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, JAVA_LONG, ADDRESS,

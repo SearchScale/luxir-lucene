@@ -345,6 +345,17 @@ LXL_API int32_t lxl_column_ord_counts_sparse(lxl_reader* r, const char* name, in
 LXL_API int32_t lxl_column_value_counts(lxl_reader* r, const char* name, int32_t name_len, const uint64_t* matches,
                                         int32_t num_matches, int32_t max_doc, int32_t sample, const void** out,
                                         int32_t* missing);
+/* Join over single-valued sorted (string) doc-values columns of n segments: sets in out[i] (max_docs[i]
+ * bits, zeroed by the caller) every doc of segment i whose to-column value is a from-column value of
+ * some doc in from_matches (any segment). Per segment: stores[i] its doc-values store (NULL: no values
+ * in either column), from_cols/from_dicts and to_cols/to_dicts the NUL-terminated column and
+ * dictionary names (NULL: no values there), from_matches/from_counts the from docs (NULL or 0: none),
+ * to_live the docs that may be output (NULL: all). *total receives the number of docs set. */
+LXL_API int32_t lxl_join_sorted(int32_t n, lxl_reader* const* stores, const int32_t* max_docs,
+                                const char* const* from_cols, const char* const* from_dicts,
+                                const uint64_t* const* from_matches, const int32_t* from_counts,
+                                const char* const* to_cols, const char* const* to_dicts,
+                                const uint64_t* const* to_live, uint64_t* const* out, int64_t* total);
 /* Frees the calling thread's lxl_column_value_counts result. */
 LXL_API void lxl_value_counts_release(void);
 /* Docs with a value whose sort key (see lxl_column_top_k) is in [los[i], his[i]]: counts[i] += 1. */
