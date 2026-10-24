@@ -198,6 +198,8 @@ public final class LxlNative {
   public static final MethodHandle READER_FREE = fn("lxl_reader_free", FunctionDescriptor.ofVoid(ADDRESS));
   public static final MethodHandle READER_NORMS =
       fn("lxl_reader_norms", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS), CRITICAL);
+  public static final MethodHandle READER_FIELD_ALIAS =
+      fn("lxl_reader_field_alias", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), CRITICAL);
 
   // terms
   public static final MethodHandle TERMS_NEW =

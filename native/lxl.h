@@ -117,6 +117,9 @@ LXL_API void lxl_reader_free(lxl_reader* r);
 /* A text field's norm byte per doc into out[max_doc] (0: no norm). 1 if the
  * field has norms, 0 if not. */
 LXL_API int32_t lxl_reader_norms(lxl_reader* r, const char* name, int32_t name_len, uint8_t* out);
+/* How the segment stores field `name`: 1 under its own name, 2 under its schema name (a native
+ * text field whose name is not a valid schema name), 0 not at all. */
+LXL_API int32_t lxl_reader_field_alias(lxl_reader* r, const char* name, int32_t name_len);
 
 /* ---- terms ------------------------------------------------------------------ */
 

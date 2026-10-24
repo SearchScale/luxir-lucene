@@ -196,6 +196,40 @@ public class TestNativeIndexing extends LuceneTestCase {
     }
   }
 
+  // A field Luxir's schema cannot hold (indexed by its schema name) in both flushed and merged
+  // segments: one native search over all of them must find it in every one.
+  public void testSchemaNamedFieldAcrossFlushAndMerge() throws Exception {
+    Random r = random();
+    titleField = "_text_";
+    LuxirAnalyzer analyzer = new LuxirAnalyzer(LuxirAnalyzer.ENGLISH);
+    try (Directory dir = newDirectory();
+        IndexWriter w = new IndexWriter(dir, config(new LuxirCodec(this::schema), analyzer, 50, true))) {
+      for (int i = 0; i < 520; i++) {
+        Document d = new Document();
+        d.add(new StringField("id", Integer.toString(i), Field.Store.YES));
+        d.add(luxirField(r, titleField, text(r), false));
+        w.addDocument(d);
+      }
+      w.commit();
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        java.util.Set<String> sources = new java.util.HashSet<>();
+        for (var ctx : reader.leaves()) {
+          sources.add(((org.apache.lucene.index.SegmentReader) ctx.reader()).getSegmentInfo().info.getDiagnostics()
+              .get("source"));
+        }
+        assertTrue("flushed and merged segments: " + sources, sources.contains("flush") && sources.contains("merge"));
+        IndexSearcher s = new IndexSearcher(reader);
+        s.setQueryCache(null);
+        for (String word : new String[] {"run", "book", "fox", "w1", "w2", "wa"}) {
+          Query q = new TermQuery(new Term(titleField, word));
+          LuxirSearch.Result res = LuxirSearch.topK(s, q, 10, null, false);
+          assertNotNull(q + " must run natively", res);
+          assertEquals(q.toString(), s.count(q), res.totalHits());
+        }
+      }
+    }
+  }
+
   private static void assertSameTerms(String field, Terms ta, Terms tb) throws IOException {
     assertEquals(field, tb.size(), ta.size());
     assertEquals(field, tb.getDocCount(), ta.getDocCount());

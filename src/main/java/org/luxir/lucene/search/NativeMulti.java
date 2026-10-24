@@ -103,6 +103,34 @@ final class NativeMulti {
     return null;
   }
 
+  // per field: whether segments store it under different names (see mixedNames)
+  private final Map<String, Boolean> mixed = new java.util.concurrent.ConcurrentHashMap<>();
+
+  /**
+   * Whether some segments store {@code field} under its own name and others under its schema name
+   * (segments merged before both were written under the schema name). One native search resolves
+   * a field's name once, so it would miss the segments with the other name.
+   */
+  boolean mixedNames(String field) {
+    return mixed.computeIfAbsent(field, f -> {
+      byte[] name = f.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      boolean own = false, schema = false;
+      for (long r : readerOfLeaf) {
+        if (r == 0) continue;
+        int how;
+        try {
+          how = check((int) LxlNative.READER_FIELD_ALIAS.invokeExact(MemorySegment.ofAddress(r), LxlNative.heap(name),
+              name.length));
+        } catch (Throwable t) {
+          throw LxlNative.rethrow(t);
+        }
+        own |= how == 1;
+        schema |= how == 2;
+      }
+      return own && schema;
+    });
+  }
+
   private boolean freed;
 
   synchronized void free() {

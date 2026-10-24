@@ -406,7 +406,8 @@ int32_t lxl_writer_start_field(lxl_writer* w, const char* name, int32_t name_len
                                int32_t num_norms) {
   return guarded([&] {
     if (w->tw) return fail("lxl: previous field not ended");
-    auto& fi = w->pw->addField(std::string_view(name, (size_t)name_len));
+    // under the name native flush indexes text with, so every segment agrees (see schemaName)
+    auto& fi = w->pw->addField(schemaName(std::string_view(name, (size_t)name_len)));
     fi.type = FieldType::TEXT;
     fi.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
     w->fi = &fi;
@@ -689,6 +690,15 @@ int32_t lxl_reader_norms(lxl_reader* r, const char* name, int32_t name_len, uint
     NormsReader::Iterator it(norms);
     for (int32_t d = it.next(); d != NormsReader::ENDDOC; d = it.next()) out[d] = it.value();
     return 1;
+  });
+}
+
+int32_t lxl_reader_field_alias(lxl_reader* r, const char* name, int32_t name_len) {
+  return guarded([&] {
+    std::string_view field(name, (size_t)name_len);
+    if (r->postings->findOrdinal(field) >= 0) return 1;
+    std::string indexed = schemaName(field);
+    return indexed != field && r->postings->findOrdinal(indexed) >= 0 ? 2 : 0;
   });
 }
 
@@ -2003,7 +2013,7 @@ int32_t lxl_writer_merge_field(lxl_writer* w, const char* name, int32_t name_len
       }
     }
 
-    auto& fi = w->pw->addField(field);
+    auto& fi = w->pw->addField(schemaName(field));  // as native flush names it
     fi.type = FieldType::TEXT;
     fi.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
     w->fi = &fi;

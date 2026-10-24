@@ -376,6 +376,9 @@ public final class LuxirSearch {
 
   /** Whether every leaf can run the encoded query natively in {@code multi}. */
   private static boolean nativeLeaves(NativeMulti multi, IndexReader top, LxlQuery.Encoded enc) throws IOException {
+    for (String f : enc.fields()) {
+      if (multi.mixedNames(f)) return false;
+    }
     List<LeafReaderContext> leaves = top.leaves();
     for (int i = 0; i < leaves.size(); i++) {
       LeafReaderContext ctx = leaves.get(i);
