@@ -145,6 +145,10 @@ public final class LxlNative {
   public static final MethodHandle NUMERIC_FILL =
       fn("lxl_numeric_fill",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT), CRITICAL);
+  public static final MethodHandle NUMERIC_FILL_ONCE =
+      fn("lxl_numeric_fill_once",
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT,
+              JAVA_INT), CRITICAL);
   public static final MethodHandle POINTS_NEW =
       fn("lxl_points_new", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS), CRITICAL);
   public static final MethodHandle POINTS_FREE = fn("lxl_points_free", FunctionDescriptor.ofVoid(ADDRESS));
@@ -163,8 +167,8 @@ public final class LxlNative {
               ADDRESS, JAVA_INT, ADDRESS));
   public static final MethodHandle COLUMN_VALUE_COUNTS =
       fn("lxl_column_value_counts",
-          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS,
-              ADDRESS));
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT,
+              ADDRESS, ADDRESS));
   public static final MethodHandle VALUE_COUNTS_RELEASE =
       fn("lxl_value_counts_release", FunctionDescriptor.ofVoid());
   public static final MethodHandle COLUMN_RANGE_COUNTS =
@@ -177,9 +181,9 @@ public final class LxlNative {
       fn("lxl_points_set", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS));
   public static final MethodHandle FACET_COLLECT =
       fn("lxl_facet_collect",
-          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT,
-              ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS,
-              ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS));
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT,
+              JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS,
+              ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS));
 
   // native analysis
   public static final MethodHandle ANALYZER_NEW =
@@ -262,6 +266,11 @@ public final class LxlNative {
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, JAVA_LONG, ADDRESS,
               ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS,
               ADDRESS, ADDRESS));
+  public static final MethodHandle MULTI_TOP_K_SORTED =
+      fn("lxl_multi_top_k_sorted",
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS,
+              JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG,
+              ADDRESS, ADDRESS, ADDRESS, ADDRESS));
 
   static {
     int abi;

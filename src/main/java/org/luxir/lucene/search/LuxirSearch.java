@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.search.SortField;
@@ -41,9 +42,15 @@ public final class LuxirSearch {
 
   /**
    * Hits sorted by score descending then doc ascending (global doc ids), the exact number of
-   * matches, and optionally the set of all matches.
+   * matches, and optionally the set of all matches: as bits, or, when asked for sparse matches and
+   * there are few, as {@code matchDocs} (ascending global doc ids) with {@code matches} null.
    */
-  public record Result(int[] docs, float[] scores, long totalHits, boolean exactCount, FixedBitSet matches) {
+  public record Result(int[] docs, float[] scores, long totalHits, boolean exactCount, FixedBitSet matches,
+      int[] matchDocs) {
+    public Result(int[] docs, float[] scores, long totalHits, boolean exactCount, FixedBitSet matches) {
+      this(docs, scores, totalHits, exactCount, matches, null);
+    }
+
     public float maxScore() {
       return docs.length == 0 ? Float.NaN : scores[0];
     }
@@ -83,10 +90,19 @@ public final class LuxirSearch {
    */
   public static Result topK(IndexSearcher searcher, Query query, List<Query> filters, int k, int minExactCount,
       FixedBitSet filter, boolean filterCached, boolean wantMatches) throws IOException {
+    return topK(searcher, query, filters, k, minExactCount, filter, filterCached, wantMatches, false);
+  }
+
+  /**
+   * As above; {@code sparseMatches}: wanted matches that are fewer than one doc in 64 (Solr's
+   * threshold for a sorted int doc set) come as {@link Result#matchDocs()} instead of bits.
+   */
+  public static Result topK(IndexSearcher searcher, Query query, List<Query> filters, int k, int minExactCount,
+      FixedBitSet filter, boolean filterCached, boolean wantMatches, boolean sparseMatches) throws IOException {
     try (Arena arena = Arena.ofConfined()) {
       Run r = run(searcher, query, filters, k, minExactCount, filter, filterCached, wantMatches, arena);
       if (r == null) return null;
-      return new Result(r.docs(), r.scores(), r.total(), r.exact(), wantMatches ? r.matches(searcher) : null);
+      return r.result(searcher, r.docs(), r.scores(), r.exact(), wantMatches, sparseMatches);
     }
   }
 
@@ -96,7 +112,52 @@ public final class LuxirSearch {
    * query or a filter cannot run natively.
    */
   private record Run(int[] docs, float[] scores, long total, boolean exact, NativeMulti multi,
-      MemorySegment[] segBits) {
+      MemorySegment[] segBits, SegTops tops) {
+    Run(int[] docs, float[] scores, long total, boolean exact, NativeMulti multi, MemorySegment[] segBits) {
+      this(docs, scores, total, exact, multi, segBits, null);
+    }
+
+    /** The result with these hits and, if wanted, the matches (see {@link Result}). */
+    Result result(IndexSearcher searcher, int[] hits, float[] scores, boolean exact, boolean wantMatches,
+        boolean sparseMatches) {
+      if (!wantMatches) return new Result(hits, scores, total, exact, null);
+      if (sparseMatches && this.exact && total < (searcher.getIndexReader().maxDoc() >> 6) + 5) {
+        return new Result(hits, scores, total, exact, null, matchDocs(searcher));
+      }
+      return new Result(hits, scores, total, exact, matches(searcher));
+    }
+
+    /** All matches as ascending index-wide doc ids (the count must be exact). */
+    int[] matchDocs(IndexSearcher searcher) {
+      int[] out = new int[(int) total];
+      if (multi == null) return out;
+      List<LeafReaderContext> leaves = searcher.getIndexReader().leaves();
+      Integer[] order = new Integer[segBits.length];
+      for (int s = 0; s < order.length; s++) order[s] = s;
+      Arrays.sort(order, Comparator.comparingInt(s -> multi.leafOfSeg[s]));
+      int n = 0;
+      long[] chunk = NativeLeaf.scratch(0);
+      for (int s : order) {
+        LeafReaderContext ctx = leaves.get(multi.leafOfSeg[s]);
+        int nwords = FixedBitSet.bits2words(ctx.reader().maxDoc());
+        // bulk copies in chunks: per-word segment access is slow until the JIT has compiled it
+        for (int start = 0; start < nwords; start += chunk.length) {
+          int len = Math.min(chunk.length, nwords - start);
+          MemorySegment.copy(segBits[s], ValueLayout.JAVA_LONG, (long) start * Long.BYTES, chunk, 0, len);
+          for (int i = 0; i < len; i++) {
+            long word = chunk[i];
+            int base = ctx.docBase + ((start + i) << 6);
+            while (word != 0) {
+              out[n++] = base + Long.numberOfTrailingZeros(word);
+              word &= word - 1;
+            }
+          }
+        }
+      }
+      if (n != out.length) throw new IllegalStateException("match count " + total + " but " + n + " matches");
+      return out;
+    }
+
     /** All matches, index-wide. */
     FixedBitSet matches(IndexSearcher searcher) {
       FixedBitSet m = new FixedBitSet(Math.max(1, searcher.getIndexReader().maxDoc()));
@@ -110,8 +171,27 @@ public final class LuxirSearch {
     }
   }
 
+  /** A sort by one column for {@link #run}: each segment's top k by it, instead of hits by score. */
+  private record ColumnSort(String field, int kind, boolean reverse, long missing, int k) {}
+
+  /**
+   * Per native segment s, its best docs by the sort (segment doc ids) and their keys, best first:
+   * {@code counts[s]} of them from {@code s * k} on.
+   */
+  private record SegTops(int k, int[] counts, int[] docs, long[] keys) {}
+
   private static Run run(IndexSearcher searcher, Query query, List<Query> filters, int k, int minExactCount,
       FixedBitSet filter, boolean filterCached, boolean wantSegBits, Arena arena) throws IOException {
+    return run(searcher, query, filters, k, minExactCount, filter, filterCached, wantSegBits, null, arena);
+  }
+
+  /**
+   * As above; with {@code sort} (no seg bits), each segment's top {@code sort.k()} (> 0) by the sort
+   * column as Luxir finds its matches (no scores, no hits by score), in {@link Run#tops()}.
+   */
+  private static Run run(IndexSearcher searcher, Query query, List<Query> filters, int k, int minExactCount,
+      FixedBitSet filter, boolean filterCached, boolean wantSegBits, ColumnSort sort, Arena arena)
+      throws IOException {
     Query rewritten = searcher.rewrite(withFilters(query, filters));
     IndexReader top = searcher.getIndexReader();
     if (rewritten instanceof MatchNoDocsQuery) return new Run(new int[0], new float[0], 0, true, null, null);
@@ -209,6 +289,10 @@ public final class LuxirSearch {
           bits.setAtIndex(ValueLayout.ADDRESS, s, segBits[s]);
         }
       }
+      if (sort != null) {
+        return runSorted(multi, leaves, q, enc.bytes().length, live, numLive, numSlots, slotBits, slotCounts, numCols,
+            colStores, colNames, colPoints, colOffsets, sort, arena);
+      }
       MemorySegment segsOut = arena.allocate(ValueLayout.JAVA_INT, Math.max(1, k));
       MemorySegment docsOut = arena.allocate(ValueLayout.JAVA_INT, Math.max(1, k));
       MemorySegment scoresOut = arena.allocate(ValueLayout.JAVA_FLOAT, Math.max(1, k));
@@ -234,6 +318,38 @@ public final class LuxirSearch {
       return new Run(docs, scores, totalOut.get(ValueLayout.JAVA_LONG, 0), exactOut.get(ValueLayout.JAVA_INT, 0) != 0,
           multi, wantSegBits ? segBits : null);
     }
+  }
+
+  private static Run runSorted(NativeMulti multi, List<LeafReaderContext> leaves, MemorySegment q, int qlen,
+      MemorySegment live, MemorySegment numLive, int numSlots, MemorySegment slotBits, MemorySegment slotCounts,
+      int numCols, MemorySegment colStores, MemorySegment colNames, MemorySegment colPoints, MemorySegment colOffsets,
+      ColumnSort sort, Arena arena) {
+    int n = multi.leafOfSeg.length;
+    int k = sort.k();
+    MemorySegment sortStores = arena.allocate(ValueLayout.ADDRESS, Math.max(1, n));
+    MemorySegment sortCols = arena.allocate(ValueLayout.ADDRESS, Math.max(1, n));
+    for (int s = 0; s < n; s++) {
+      NativeLeaf.NativeColumn col = NativeLeaf.nativeColumn(leaves.get(multi.leafOfSeg[s]).reader(), sort.field());
+      if (col == null) return null;
+      if (col == NativeLeaf.NO_COLUMN || col.store().equals(MemorySegment.NULL)) continue; // missing key here
+      sortStores.setAtIndex(ValueLayout.ADDRESS, s, col.store());
+      byte[] name = Arrays.copyOf(col.column(), col.column().length + 1); // NUL-terminated
+      sortCols.setAtIndex(ValueLayout.ADDRESS, s, arena.allocateFrom(ValueLayout.JAVA_BYTE, name));
+    }
+    MemorySegment counts = arena.allocate(ValueLayout.JAVA_INT, Math.max(1, n));
+    MemorySegment docs = arena.allocate(ValueLayout.JAVA_INT, Math.max(1, (long) n * k));
+    MemorySegment keys = arena.allocate(ValueLayout.JAVA_LONG, Math.max(1, (long) n * k));
+    MemorySegment totalOut = arena.allocate(ValueLayout.JAVA_LONG);
+    try {
+      check((int) LxlNative.MULTI_TOP_K_SORTED.invokeExact(multi.handle, q, (long) qlen, live, numLive, numSlots,
+          slotBits, slotCounts, numCols, colStores, colNames, colPoints, colOffsets, sortStores, sortCols, sort.kind(),
+          k, sort.reverse() ? 1 : 0, sort.missing(), counts, docs, keys, totalOut));
+    } catch (Throwable t) {
+      throw LxlNative.rethrow(t);
+    }
+    SegTops tops = new SegTops(k, counts.toArray(ValueLayout.JAVA_INT), docs.toArray(ValueLayout.JAVA_INT),
+        keys.toArray(ValueLayout.JAVA_LONG));
+    return new Run(new int[0], new float[0], totalOut.get(ValueLayout.JAVA_LONG, 0), true, multi, null, tops);
   }
 
   /**
@@ -271,26 +387,46 @@ public final class LuxirSearch {
   /** As above; {@code filterCached} as for {@link #topK}. */
   public static Result topKSorted(IndexSearcher searcher, Query query, List<Query> filters, SortField sf, int k,
       FixedBitSet filter, boolean filterCached, boolean wantMatches) throws IOException {
+    return topKSorted(searcher, query, filters, sf, k, filter, filterCached, wantMatches, false);
+  }
+
+  /** As above; {@code sparseMatches} as for {@link #topK}. */
+  public static Result topKSorted(IndexSearcher searcher, Query query, List<Query> filters, SortField sf, int k,
+      FixedBitSet filter, boolean filterCached, boolean wantMatches, boolean sparseMatches) throws IOException {
     if (!sortSupported(searcher, sf)) return null;
     try (Arena arena = Arena.ofConfined()) {
-      Run all = run(searcher, query, filters, 0, Integer.MAX_VALUE, filter, filterCached, true, arena);
+      // without the match set, each segment's top k is kept as Luxir finds the matches
+      ColumnSort sort = wantMatches || k <= 0 ? null
+          : new ColumnSort(sf.getField(), sortKind(sf), sf.getReverse(), missingKey(sf), k);
+      Run all = run(searcher, query, filters, 0, Integer.MAX_VALUE, filter, filterCached, sort == null, sort, arena);
       if (all == null) return null;
-      return sorted(searcher, all, sf, k, wantMatches, arena);
+      return sorted(searcher, all, sf, k, wantMatches, sparseMatches, arena);
     }
   }
 
-  private static Result sorted(IndexSearcher searcher, Run all, SortField sf, int k, boolean wantMatches, Arena arena)
-      throws IOException {
-    int kind = switch (sf.getType()) {
-      case FLOAT -> LxlNative.SORT_FLOAT_BITS;
-      case DOUBLE -> LxlNative.SORT_DOUBLE_BITS;
-      default -> LxlNative.SORT_LONG;
-    };
+  private static Result sorted(IndexSearcher searcher, Run all, SortField sf, int k, boolean wantMatches,
+      boolean sparseMatches, Arena arena) throws IOException {
+    int kind = sortKind(sf);
     boolean string = sf.getType() == SortField.Type.STRING;
     boolean reverse = sf.getReverse();
     long missing = missingKey(sf);
     List<Candidate> cands = new ArrayList<>();
-    if (k > 0 && all.total() > 0 && all.multi() != null) {
+    if (k > 0 && all.total() > 0 && all.multi() != null && all.tops() != null) {
+      List<LeafReaderContext> leaves = searcher.getIndexReader().leaves();
+      SegTops tops = all.tops();
+      for (int s = 0; s < tops.counts().length; s++) {
+        LeafReaderContext ctx = leaves.get(all.multi().leafOfSeg[s]);
+        SortedDocValues terms = string && tops.counts()[s] > 0 ? ctx.reader().getSortedDocValues(sf.getField()) : null;
+        for (int i = s * tops.k(); i < s * tops.k() + tops.counts()[s]; i++) {
+          long key = tops.keys()[i];
+          BytesRef term = null;
+          if (string && terms != null && key >= 0 && key != Long.MAX_VALUE) {
+            term = BytesRef.deepCopyOf(terms.lookupOrd((int) key));
+          }
+          cands.add(new Candidate(ctx.docBase + tops.docs()[i], key, term));
+        }
+      }
+    } else if (k > 0 && all.total() > 0 && all.multi() != null) {
       List<LeafReaderContext> leaves = searcher.getIndexReader().leaves();
       {
         MemorySegment docsOut = arena.allocate(ValueLayout.JAVA_INT, k);
@@ -350,10 +486,19 @@ public final class LuxirSearch {
       docs[i] = cands.get(i).doc;
       scores[i] = Float.NaN;
     }
-    return new Result(docs, scores, all.total(), true, wantMatches ? all.matches(searcher) : null);
+    return all.result(searcher, docs, scores, true, wantMatches, sparseMatches);
   }
 
   private record Candidate(int doc, long key, BytesRef term) {}
+
+  /** How the sort's column keys order (see {@link LxlNative#SORT_LONG}). */
+  private static int sortKind(SortField sf) {
+    return switch (sf.getType()) {
+      case FLOAT -> LxlNative.SORT_FLOAT_BITS;
+      case DOUBLE -> LxlNative.SORT_DOUBLE_BITS;
+      default -> LxlNative.SORT_LONG;
+    };
+  }
 
   /** The sortable key of the sort's missing value (Lucene's defaults: 0, strings first). */
   private static long missingKey(SortField sf) {

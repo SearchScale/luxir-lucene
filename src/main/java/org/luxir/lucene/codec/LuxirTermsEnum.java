@@ -28,7 +28,7 @@ import org.luxir.lucene.LxlNative;
  * enumerates the terms a byte DFA accepts, with the whole walk (prefix seek, successor jumps,
  * suffix rejection) done natively by Luxir's DfaIntersectEnum.
  *
- * <p>Native objects are freed by a Cleaner once this enum is unreachable, so every native call is
+ * <p>Native objects are freed by NativeCleaner once this enum is unreachable, so every native call is
  * followed by a reachability fence on {@code this}.
  */
 final class LuxirTermsEnum extends BaseTermsEnum {

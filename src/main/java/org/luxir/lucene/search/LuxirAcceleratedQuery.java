@@ -10,7 +10,6 @@ import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.lang.ref.Cleaner;
 import java.lang.ref.Reference;
 import java.util.Objects;
 import java.util.function.Supplier;
@@ -29,6 +28,7 @@ import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.util.Bits;
 import org.luxir.lucene.LxlNative;
+import org.luxir.lucene.NativeCleaner;
 
 /**
  * Wraps a query so that, on segments whose fields are stored in Luxir format, top-level bulk
@@ -42,7 +42,6 @@ import org.luxir.lucene.LxlNative;
  */
 public final class LuxirAcceleratedQuery extends Query {
   static final int WINDOW = 4096;
-  private static final Cleaner CLEANER = Cleaner.create();
 
   private final Query in;
 
@@ -185,7 +184,7 @@ public final class LuxirAcceleratedQuery extends Query {
       this.query = query;
       this.scoreMode = scoreMode;
       this.inner = inner;
-      CLEANER.register(this, exec);
+      NativeCleaner.register(this, exec);
     }
 
     private void start(Bits acceptDocs) {
@@ -230,7 +229,7 @@ public final class LuxirAcceleratedQuery extends Query {
         } catch (Throwable t) {
           throw LxlNative.rethrow(t);
         } finally {
-          Reference.reachabilityFence(this); // the Cleaner frees the exec when this is unreachable
+          Reference.reachabilityFence(this); // NativeCleaner frees the exec when this is unreachable
         }
         check(rc);
         for (int i = 0; i < n[0]; i++) {

@@ -1667,18 +1667,26 @@ lxl_multi* lxl_multi_new(int32_t n, lxl_reader* const* readers) {
 
 void lxl_multi_free(lxl_multi* m) { delete m; }
 
-int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
-                        const uint64_t* const* live, const int32_t* num_live, int32_t k,
-                        int64_t count_limit, int32_t* segs, int32_t* docs, float* scores,
-                        int64_t* total_hits, int32_t* count_exact,
-                        uint64_t* const* match_bits, int32_t num_slots,
-                        const uint64_t* const* slot_bits, const int32_t* slot_counts, int32_t num_cols,
-                        lxl_reader* const* col_stores, const char* const* col_names,
-                        lxl_points* const* col_points, const int64_t* col_offsets) {
-  return guarded([&]() -> int32_t {
-    auto segments = m->index->segments();
-    size_t n = segments.size();
-    SlotTable slots;
+}  // extern "C"
+
+namespace {
+
+// The per-call state of a search over a lxl_multi's segments: the bitsets and doc-values columns
+// the query's slot and column-range clauses refer to, the prepared query, and each segment's live
+// docs as its filter.
+struct MultiCall {
+  std::span<Segment> segments;
+  size_t n;
+  SlotTable slots;
+  ColumnTable cols;
+  std::optional<Prepared> prepared;
+  std::vector<std::optional<BitDocSet>> filters;
+
+  MultiCall(lxl_multi* m, const uint8_t* query, int64_t query_len, const uint64_t* const* live,
+            const int32_t* num_live, int32_t num_slots, const uint64_t* const* slot_bits,
+            const int32_t* slot_counts, int32_t num_cols, lxl_reader* const* col_stores,
+            const char* const* col_names, lxl_points* const* col_points, const int64_t* col_offsets)
+      : segments(m->index->segments()), n(segments.size()) {
     slots.numSegs = n;
     // Sized once: a BitDocSet cannot move.
     slots.sets = std::vector<std::optional<BitDocSet>>((size_t)std::max(0, num_slots) * n);
@@ -1689,7 +1697,6 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
         slots.sets[at].emplace(FixedBitSet(const_cast<uint64_t*>(slot_bits[at]), segments[i].maxDoc()), slot_counts[at]);
       }
     }
-    ColumnTable cols;
     cols.numSegs = n;
     cols.entries.resize((size_t)std::max(0, num_cols) * n);
     for (size_t at = 0; at < cols.entries.size(); at++) {
@@ -1699,14 +1706,37 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
       cols.entries[at].points = col_points[at] != nullptr ? lxlPointsReader(col_points[at]) : nullptr;
       cols.entries[at].pointsOffset = col_offsets[at];
     }
-    Prepared prepared(*m->index, query, query_len, &slots, &cols);
-    std::vector<std::optional<BitDocSet>> filters(n);
+    prepared.emplace(*m->index, query, query_len, &slots, &cols);
+    filters = std::vector<std::optional<BitDocSet>>(n);
     for (size_t i = 0; i < n; i++) {
       if (live[i] != nullptr) {
         filters[i].emplace(FixedBitSet(const_cast<uint64_t*>(live[i]), segments[i].maxDoc()), num_live[i]);
       }
     }
-    auto filterOf = [&](size_t i) -> DocSet* { return filters[i] ? &*filters[i] : nullptr; };
+  }
+
+  DocSet* filterOf(size_t i) { return filters[i] ? &*filters[i] : nullptr; }
+};
+
+}  // namespace
+
+extern "C" {
+
+int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
+                        const uint64_t* const* live, const int32_t* num_live, int32_t k,
+                        int64_t count_limit, int32_t* segs, int32_t* docs, float* scores,
+                        int64_t* total_hits, int32_t* count_exact,
+                        uint64_t* const* match_bits, int32_t num_slots,
+                        const uint64_t* const* slot_bits, const int32_t* slot_counts, int32_t num_cols,
+                        lxl_reader* const* col_stores, const char* const* col_names,
+                        lxl_points* const* col_points, const int64_t* col_offsets) {
+  return guarded([&]() -> int32_t {
+    MultiCall call(m, query, query_len, live, num_live, num_slots, slot_bits, slot_counts, num_cols, col_stores,
+                   col_names, col_points, col_offsets);
+    auto segments = call.segments;
+    size_t n = call.n;
+    Prepared& prepared = *call.prepared;
+    auto filterOf = [&](size_t i) -> DocSet* { return call.filterOf(i); };
 
     int64_t count = -1;
     bool exact = true;
@@ -2592,14 +2622,29 @@ int32_t lxl_stored_doc(lxl_stored* s, int32_t doc, uint8_t* out, int32_t cap) {
   });
 }
 
+}  // extern "C"
+
+namespace {
+
+void openNumeric(lxl_numeric& c, lxl_reader* r, const char* name, int32_t name_len) {
+  auto info = findField(*r->postings, std::string_view(name, (size_t)name_len));
+  if (!info) throw std::runtime_error("lxl: no such numeric column");
+  c.col = std::make_unique<IntColReader>(*r->postings, *info);
+  c.it = std::make_unique<IntColReader::Iterator>(*c.col);
+  c.multi = c.col->multiValued();
+}
+
+int32_t fillNumeric(lxl_numeric* c, int32_t target, int32_t* docs, int32_t* counts, int64_t* values, int32_t cap,
+                    int32_t value_cap);
+
+}  // namespace
+
+extern "C" {
+
 lxl_numeric* lxl_numeric_new(lxl_reader* r, const char* name, int32_t name_len) {
   return guardedPtr<lxl_numeric>([&]() -> lxl_numeric* {
-    auto info = findField(*r->postings, std::string_view(name, (size_t)name_len));
-    if (!info) throw std::runtime_error("lxl: no such numeric column");
     auto c = std::make_unique<lxl_numeric>();
-    c->col = std::make_unique<IntColReader>(*r->postings, *info);
-    c->it = std::make_unique<IntColReader::Iterator>(*c->col);
-    c->multi = c->col->multiValued();
+    openNumeric(*c, r, name, name_len);
     return c.release();
   });
 }
@@ -2608,32 +2653,49 @@ void lxl_numeric_free(lxl_numeric* c) { delete c; }
 
 int32_t lxl_numeric_fill(lxl_numeric* c, int32_t target, int32_t* docs, int32_t* counts,
                          int64_t* values, int32_t cap, int32_t value_cap) {
+  return guarded([&] { return fillNumeric(c, target, docs, counts, values, cap, value_cap); });
+}
+
+int32_t lxl_numeric_fill_once(lxl_reader* r, const char* name, int32_t name_len, int32_t target, int32_t* docs,
+                              int32_t* counts, int64_t* values, int32_t cap, int32_t value_cap) {
   return guarded([&] {
-    auto& it = *c->it;
-    if (c->cur < target) c->cur = it.advance(target);
-    int32_t n = 0;
-    int32_t nv = 0;
-    while (c->cur != IntColReader::ENDDOC && n < cap) {
-      if (c->multi) {
-        auto [start, end] = c->col->getStartEndValueRank(it.rank());
-        int32_t k = (int32_t)(end - start);
-        if (nv + k > value_cap) {
-          if (n == 0) return fail("lxl: value buffer too small");
-          break;
-        }
-        for (int32_t j = 0; j < k; j++) values[nv++] = it.values().valueAt(start + j);
-        counts[n] = k;
-      } else {
-        values[n] = it.value();
-      }
-      docs[n++] = c->cur;
-      c->cur = it.next();
-    }
-    return n;
+    lxl_numeric c;
+    openNumeric(c, r, name, name_len);
+    return fillNumeric(&c, target, docs, counts, values, cap, value_cap);
   });
 }
 
 }  // extern "C"
+
+namespace {
+
+// Up to cap docs >= target with their values, as lxl_numeric_fill.
+int32_t fillNumeric(lxl_numeric* c, int32_t target, int32_t* docs, int32_t* counts, int64_t* values, int32_t cap,
+                    int32_t value_cap) {
+  auto& it = *c->it;
+  if (c->cur < target) c->cur = it.advance(target);
+  int32_t n = 0;
+  int32_t nv = 0;
+  while (c->cur != IntColReader::ENDDOC && n < cap) {
+    if (c->multi) {
+      auto [start, end] = c->col->getStartEndValueRank(it.rank());
+      int32_t k = (int32_t)(end - start);
+      if (nv + k > value_cap) {
+        if (n == 0) return fail("lxl: value buffer too small");
+        break;
+      }
+      for (int32_t j = 0; j < k; j++) values[nv++] = it.values().valueAt(start + j);
+      counts[n] = k;
+    } else {
+      values[n] = it.value();
+    }
+    docs[n++] = c->cur;
+    c->cur = it.next();
+  }
+  return n;
+}
+
+}  // namespace
 
 // Sortable int64 key of a column value: raw longs (ints, longs, dates, ordinals), or float/double
 // bits mapped so that signed comparison follows Float.compare / Double.compare.
@@ -2654,24 +2716,86 @@ static inline std::optional<int64_t> blockBest(const NumBlockZone& z, int32_t ki
   return sortKey(kind, reverse ? z.max : z.min);
 }
 
+// The best k docs of a segment by a single-valued column's sort key, offered matching docs in
+// increasing order. Ties go to the lower doc, whatever the direction (Lucene's). Without a column
+// (no values in the segment), every doc takes the missing key.
 template <typename It>
-static int32_t columnTopK(IntColReader& col, int32_t kind, const uint64_t* matches, int32_t max_doc, int32_t k,
-                          bool reverse, int64_t missing, int32_t* docs_out, int64_t* keys_out) {
-  // before(a, b): a ranks before b. Ties go to the lower doc, whatever the direction (Lucene's).
+class ColumnTopK {
+  IntColReader* col;
+  std::optional<It> it;
+  int32_t kind;
+  int32_t k;
+  bool reverse;
+  int64_t missing;
   // As the heap's "less", the heap's top is the worst kept, and sort_heap yields best first.
-  auto before = [reverse](const std::pair<int64_t, int32_t>& a, const std::pair<int64_t, int32_t>& b) {
-    if (a.first != b.first) return reverse ? a.first > b.first : a.first < b.first;
-    return a.second < b.second;
-  };
-  // strictly better key (docs come in increasing order, so a tie with the worst kept never enters)
-  auto betterKey = [reverse](int64_t a, int64_t b) { return reverse ? a > b : a < b; };
   std::vector<std::pair<int64_t, int32_t>> heap;
-  heap.reserve((size_t)k);
-  It it(col);
   int32_t cur = -1;
   // zone pruning: once k docs are kept, a block whose best key cannot beat the worst kept is skipped
   int64_t zoneBlock = -1;
   std::optional<int64_t> zoneBest;
+
+  // before(a, b): a ranks before b
+  bool before(const std::pair<int64_t, int32_t>& a, const std::pair<int64_t, int32_t>& b) const {
+    if (a.first != b.first) return reverse ? a.first > b.first : a.first < b.first;
+    return a.second < b.second;
+  }
+
+  // strictly better key (docs come in increasing order, so a tie with the worst kept never enters)
+  bool betterKey(int64_t a, int64_t b) const { return reverse ? a > b : a < b; }
+
+public:
+  ColumnTopK(IntColReader* col, int32_t kind, int32_t k, bool reverse, int64_t missing)
+      : col(col), kind(kind), k(k), reverse(reverse), missing(missing) {
+    if (col != nullptr) it.emplace(*col);
+    heap.reserve((size_t)k);
+  }
+
+  void offer(int32_t d) {
+    bool full = (int32_t)heap.size() == k;
+    int64_t key = missing;
+    if (it) {
+      if (cur < d) cur = it->advance(d);
+      if (cur == d) {
+        if (full) {
+          int64_t block = it->rank() / (int64_t)IntColReader::BLOCK_SIZE;
+          if (block != zoneBlock) {
+            zoneBlock = block;
+            zoneBest = blockBest(col->blockZone(block), kind, reverse);
+          }
+          if (zoneBest && !betterKey(*zoneBest, heap.front().first)) return;
+        }
+        key = sortKey(kind, it->value());
+      }
+    } else if (full) {
+      return;  // every key is the missing one: the lowest docs are kept
+    }
+    std::pair<int64_t, int32_t> e{key, d};
+    auto less = [this](const auto& a, const auto& b) { return before(a, b); };
+    if (!full) {
+      heap.push_back(e);
+      std::push_heap(heap.begin(), heap.end(), less);
+    } else if (before(e, heap.front())) {
+      std::pop_heap(heap.begin(), heap.end(), less);
+      heap.back() = e;
+      std::push_heap(heap.begin(), heap.end(), less);
+    }
+  }
+
+  // Writes the kept docs best first; returns how many.
+  int32_t finish(int32_t* docs_out, int64_t* keys_out) {
+    std::sort_heap(heap.begin(), heap.end(), [this](const auto& a, const auto& b) { return before(a, b); });
+    for (size_t i = 0; i < heap.size(); i++) {
+      keys_out[i] = heap[i].first;
+      docs_out[i] = heap[i].second;
+    }
+    return (int32_t)heap.size();
+  }
+};
+
+template <typename It>
+static int32_t columnTopK(IntColReader& col, int32_t kind, const uint64_t* matches, int32_t max_doc, int32_t k,
+                          bool reverse, int64_t missing, int32_t* docs_out, int64_t* keys_out) {
+  ColumnTopK<It> top(&col, kind, k, reverse, missing);
   size_t words = FixedBitSet::sizeInWords(max_doc);
   for (size_t w = 0; w < words; w++) {
     uint64_t word = matches[w];
@@ -2679,39 +2803,10 @@ static int32_t columnTopK(IntColReader& col, int32_t kind, const uint64_t* match
       int32_t d = (int32_t)(w << 6) + std::countr_zero(word);
       word &= word - 1;
       if (d >= max_doc) break;
-      if (cur < d) cur = it.advance(d);
-      bool full = (int32_t)heap.size() == k;
-      int64_t key;
-      if (cur == d) {
-        if (full) {
-          int64_t block = it.rank() / (int64_t)IntColReader::BLOCK_SIZE;
-          if (block != zoneBlock) {
-            zoneBlock = block;
-            zoneBest = blockBest(col.blockZone(block), kind, reverse);
-          }
-          if (zoneBest && !betterKey(*zoneBest, heap.front().first)) continue;
-        }
-        key = sortKey(kind, it.value());
-      } else {
-        key = missing;
-      }
-      std::pair<int64_t, int32_t> e{key, d};
-      if (!full) {
-        heap.push_back(e);
-        std::push_heap(heap.begin(), heap.end(), before);
-      } else if (before(e, heap.front())) {
-        std::pop_heap(heap.begin(), heap.end(), before);
-        heap.back() = e;
-        std::push_heap(heap.begin(), heap.end(), before);
-      }
+      top.offer(d);
     }
   }
-  std::sort_heap(heap.begin(), heap.end(), before);  // best first
-  for (size_t i = 0; i < heap.size(); i++) {
-    keys_out[i] = heap[i].first;
-    docs_out[i] = heap[i].second;
-  }
-  return (int32_t)heap.size();
+  return top.finish(docs_out, keys_out);
 }
 
 extern "C" {
@@ -2732,6 +2827,72 @@ int32_t lxl_column_top_k(lxl_reader* r, const char* name, int32_t name_len, int3
     }
     return columnTopK<IntColReader::BulkIterator>(col, kind, matches, max_doc, k, reverse != 0, missing_key, docs_out,
                                                  keys_out);
+  });
+}
+
+int32_t lxl_multi_top_k_sorted(lxl_multi* m, const uint8_t* query, int64_t query_len, const uint64_t* const* live,
+                               const int32_t* num_live, int32_t num_slots, const uint64_t* const* slot_bits,
+                               const int32_t* slot_counts, int32_t num_cols, lxl_reader* const* col_stores,
+                               const char* const* col_names, lxl_points* const* col_points,
+                               const int64_t* col_offsets, lxl_reader* const* sort_stores,
+                               const char* const* sort_cols, int32_t kind, int32_t k, int32_t reverse,
+                               int64_t missing_key, int32_t* seg_counts, int32_t* docs_out, int64_t* keys_out,
+                               int64_t* total_hits) {
+  return guarded([&]() -> int32_t {
+    if (k <= 0) throw std::invalid_argument("lxl: k must be positive");
+    MultiCall call(m, query, query_len, live, num_live, num_slots, slot_bits, slot_counts, num_cols, col_stores,
+                   col_names, col_points, col_offsets);
+    Prepared& prepared = *call.prepared;
+    int64_t count = 0;
+    auto* w = prepared.weight(0);
+    for (size_t i = 0; i < call.n; i++) {
+      seg_counts[i] = 0;
+      if (live[i] != nullptr && num_live[i] == 0) continue;
+      Segment& seg = call.segments[i];
+      auto* supplier = w->scorerSupplier(prepared.pool, seg);
+      if (supplier == nullptr) continue;
+      int32_t maxDoc = seg.maxDoc();
+      DocSet* filter = call.filterOf(i);
+      std::optional<IntColReader> col;
+      if (sort_stores[i] != nullptr) {
+        auto info = findField(*sort_stores[i]->postings, std::string_view(sort_cols[i]));
+        if (!info) throw std::runtime_error("lxl: no such column");
+        col.emplace(*sort_stores[i]->postings, *info);
+        if (col->multiValued()) throw std::invalid_argument("lxl: sorting needs a single-valued column");
+      }
+      // each segment's matches go straight to its top k, as they are found: no match bits
+      auto collect = [&](auto& top) {
+        if (BulkScorer* bulk = bulkFor(prepared.pool, *supplier, Query::ExecutionUse::MATCH_WINDOWS)) {
+          int32_t cursor = 0;
+          while (cursor != PostingsReader::END && cursor < maxDoc) {
+            ScoreWindow window;
+            int32_t next = bulk->matchNextWindow(window, filter, cursor, maxDoc);
+            for (int32_t j = 0; j < window.size; j++) top.offer(window.docs[(size_t)j]);
+            count += window.size;
+            if (next == PostingsReader::END) break;
+            cursor = next;
+          }
+        } else if (auto* s = pullScorer(prepared.pool, *supplier)) {
+          for (int32_t d = s->next(); d != PostingsReader::END; d = s->next()) {
+            if (filter != nullptr && !filter->get(d)) continue;
+            top.offer(d);
+            count++;
+          }
+        }
+        return top.finish(docs_out + i * (size_t)k, keys_out + i * (size_t)k);
+      };
+      IntColReader* c = col ? &*col : nullptr;
+      // a few matches skip far between values: decode them one by one
+      if (std::min<int64_t>(supplier->cost(), maxDoc) * 16 < maxDoc) {
+        ColumnTopK<IntColReader::SparseIterator> top(c, kind, k, reverse != 0, missing_key);
+        seg_counts[i] = collect(top);
+      } else {
+        ColumnTopK<IntColReader::BulkIterator> top(c, kind, k, reverse != 0, missing_key);
+        seg_counts[i] = collect(top);
+      }
+    }
+    *total_hits = count;
+    return 0;
   });
 }
 
@@ -2786,17 +2947,66 @@ void forEachMatch(IntColReader& col, const uint64_t* matches, int32_t max_doc, F
   }
 }
 
+// As forEachMatch, for the n matching docs listed (ascending) in docs. Kept apart from the bitset
+// walk: sharing one loop body made the compiler's code for that walk measurably slower.
+template <typename It, typename F>
+void forEachListed(IntColReader& col, const int32_t* docs, int32_t n, int32_t max_doc, F&& f) {
+  It it(col);
+  bool multi = col.multiValued();
+  int32_t cur = -1;
+  thread_local std::vector<int64_t> tlVals;
+  auto& vals = tlVals;  // one TLS lookup per call, not per doc
+  if (!multi && col.docsWithValue() >= max_doc) {
+    auto& values = it.values();
+    for (int32_t i = 0; i < n; i++) {
+      int32_t d = docs[i];
+      int64_t one = values.valueAt(d);
+      f(d, std::span<const int64_t>(&one, 1));
+    }
+    return;
+  }
+  for (int32_t i = 0; i < n; i++) {
+    int32_t d = docs[i];
+    if (cur < d) cur = it.advance(d);
+    if (cur != d) {
+      f(d, std::span<const int64_t>());
+    } else if (!multi) {
+      int64_t one = it.value();
+      f(d, std::span<const int64_t>(&one, 1));
+    } else {
+      vals.clear();
+      auto [start, end] = col.getStartEndValueRank(it.rank());
+      for (auto v = start; v < end; v++) vals.push_back(it.values().valueAt(v));
+      f(d, std::span<const int64_t>(vals));
+    }
+  }
+}
+
+// As forEachMatch over the column `name`; docs, when not null, lists the matches instead of matches.
 template <typename F>
-void scanColumn(lxl_reader* r, const char* name, int32_t name_len, const uint64_t* matches, int32_t num_matches,
-                int32_t max_doc, F&& f) {
+void scanColumn(lxl_reader* r, const char* name, int32_t name_len, const uint64_t* matches, const int32_t* docs,
+                int32_t num_matches, int32_t max_doc, F&& f) {
   auto info = findField(*r->postings, std::string_view(name, (size_t)name_len));
   if (!info) throw std::runtime_error("lxl: no such column");
   IntColReader col(*r->postings, *info);
-  if ((int64_t)num_matches * 16 < max_doc) {
+  bool sparse = (int64_t)num_matches * 16 < max_doc;
+  if (docs != nullptr) {
+    if (sparse) {
+      forEachListed<IntColReader::SparseIterator>(col, docs, num_matches, max_doc, f);
+    } else {
+      forEachListed<IntColReader::BulkIterator>(col, docs, num_matches, max_doc, f);
+    }
+  } else if (sparse) {
     forEachMatch<IntColReader::SparseIterator>(col, matches, max_doc, f);
   } else {
     forEachMatch<IntColReader::BulkIterator>(col, matches, max_doc, f);
   }
+}
+
+template <typename F>
+void scanColumn(lxl_reader* r, const char* name, int32_t name_len, const uint64_t* matches, int32_t num_matches,
+                int32_t max_doc, F&& f) {
+  scanColumn(r, name, name_len, matches, nullptr, num_matches, max_doc, std::forward<F>(f));
 }
 
 }  // namespace
@@ -3023,8 +3233,8 @@ thread_local std::vector<ValueCount> tlValueCounts;  // the last result of the c
 }  // namespace
 
 int32_t lxl_column_value_counts(lxl_reader* r, const char* name, int32_t name_len, const uint64_t* matches,
-                                int32_t num_matches, int32_t max_doc, int32_t sample, const void** out,
-                                int32_t* missing) {
+                                const int32_t* docs, int32_t num_matches, int32_t max_doc, int32_t sample,
+                                const void** out, int32_t* missing) {
   return guarded([&]() -> int32_t {
     auto& entries = tlValueCounts;
     entries.clear();
@@ -3038,7 +3248,7 @@ int32_t lxl_column_value_counts(lxl_reader* r, const char* name, int32_t name_le
     boost::unordered_flat_map<int64_t, std::pair<int32_t, int32_t>> byValue;  // count, first doc
     bool listing = false;
     int64_t seen = 0;
-    scanColumn(r, name, name_len, matches, num_matches, max_doc, [&](int32_t d, std::span<const int64_t> v) {
+    scanColumn(r, name, name_len, matches, docs, num_matches, max_doc, [&](int32_t d, std::span<const int64_t> v) {
       if (v.empty()) {
         (*missing)++;
         return;
@@ -3500,16 +3710,16 @@ struct FacetAgg {
 
 extern "C" {
 
-int32_t lxl_facet_collect(lxl_reader* r, const uint64_t* matches, int32_t num_matches, int32_t max_doc,
-                          int32_t group, const char* gname, int32_t gname_len, int32_t slot, const int32_t* ord_slots,
-                          int64_t n_ords, int32_t range_kind, int32_t n_ranges, const int64_t* los,
-                          const int64_t* his, int64_t* counts, int32_t n_aggs, const char* names,
+int32_t lxl_facet_collect(lxl_reader* r, const uint64_t* matches, const int32_t* docs, int32_t num_matches,
+                          int32_t max_doc, int32_t group, const char* gname, int32_t gname_len, int32_t slot,
+                          const int32_t* ord_slots, int64_t n_ords, int32_t range_kind, int32_t n_ranges,
+                          const int64_t* los, const int64_t* his, int64_t* counts, int32_t n_aggs, const char* names,
                           const int32_t* name_offs, const int32_t* ops, const int32_t* types, double* const* d0,
                           double* const* d1, int64_t* const* l0, int32_t* const* i0, uint64_t* const* bits) {
   return guarded([&]() -> int32_t {
     if (num_matches == 0) return 0;
-    // decoding single values only pays off when blocks of 128 values are mostly skipped
-    bool sparse = (int64_t)num_matches * 256 < max_doc;
+    // decoding single values pays off below about 8 matches per 128-value frame, as for scanColumn
+    bool sparse = (int64_t)num_matches * 16 < max_doc;
     std::vector<FacetAgg> aggs((size_t)n_aggs);
     for (int32_t a = 0; a < n_aggs; a++) {
       FacetAgg& g = aggs[(size_t)a];
@@ -3564,7 +3774,9 @@ int32_t lxl_facet_collect(lxl_reader* r, const uint64_t* matches, int32_t num_ma
       pairs.emplace_back(d, s);
       if (pairs.size() >= 65536) flush();
     };
-    if (group == GROUP_SLOT) {
+    if (group == GROUP_SLOT && docs != nullptr) {
+      for (int32_t i = 0; i < num_matches; i++) add(docs[i], slot);
+    } else if (group == GROUP_SLOT) {
       size_t words = FixedBitSet::sizeInWords(max_doc);
       for (size_t w = 0; w < words; w++) {
         uint64_t word = matches[w];
@@ -3577,7 +3789,7 @@ int32_t lxl_facet_collect(lxl_reader* r, const uint64_t* matches, int32_t num_ma
       }
     } else if (group == GROUP_ORDS) {
       if (findField(*r->postings, std::string_view(gname, (size_t)gname_len))) {
-        scanColumn(r, gname, gname_len, matches, num_matches, max_doc, [&](int32_t d, std::span<const int64_t> v) {
+        scanColumn(r, gname, gname_len, matches, docs, num_matches, max_doc, [&](int32_t d, std::span<const int64_t> v) {
           for (int64_t ord : v) {
             if (ord < 0 || ord >= n_ords) throw std::invalid_argument("lxl: ordinal out of range");
             int32_t s = ord_slots[ord];
@@ -3593,7 +3805,7 @@ int32_t lxl_facet_collect(lxl_reader* r, const uint64_t* matches, int32_t num_ma
         ascending = los[i] <= his[i] && (i == 0 || his[i - 1] < los[i]);
       }
       if (findField(*r->postings, std::string_view(gname, (size_t)gname_len))) {
-        scanColumn(r, gname, gname_len, matches, num_matches, max_doc, [&](int32_t d, std::span<const int64_t> v) {
+        scanColumn(r, gname, gname_len, matches, docs, num_matches, max_doc, [&](int32_t d, std::span<const int64_t> v) {
           if (v.empty()) return;
           if (ascending && v.size() == 1) {
             int64_t key = sortKey(range_kind, v[0]);

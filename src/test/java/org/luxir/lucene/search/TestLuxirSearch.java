@@ -12,6 +12,7 @@ import org.apache.lucene.analysis.Analyzer;
 import org.luxir.lucene.document.LuxirValueField;
 import org.apache.lucene.util.NumericUtils;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.IndexOrDocValuesQuery;
 import org.apache.lucene.index.DocValuesType;
@@ -34,6 +35,7 @@ import org.apache.lucene.index.IndexWriter;
 import org.luxir.lucene.LxlNative;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
@@ -367,7 +369,27 @@ public class TestLuxirSearch extends LuceneTestCase {
     FixedBitSet want = new FixedBitSet(Math.max(1, cs.getIndexReader().maxDoc()));
     for (ScoreDoc sd : all.scoreDocs) want.set(sd.doc);
     assertEquals(info, want, res.matches());
+    // sparse matches: few come as a sorted doc list, the rest as bits
+    LuxirSearch.Result sparse = LuxirSearch.topK(ls, q, filters, 10, Integer.MAX_VALUE, null, false, true, true);
+    assertEquals(info, res.totalHits(), sparse.totalHits());
+    if (sparse.matchDocs() != null) {
+      assertNull(info, sparse.matches());
+      assertTrue(info, sparse.totalHits() < (ls.getIndexReader().maxDoc() >> 6) + 5);
+      assertArrayEquals(info, docs(want), sparse.matchDocs());
+    } else {
+      assertEquals(info, want, sparse.matches());
+    }
     return true;
+  }
+
+  private static int[] docs(FixedBitSet bits) {
+    int[] out = new int[bits.cardinality()];
+    int n = 0;
+    for (int d = bits.nextSetBit(0); d != DocIdSetIterator.NO_MORE_DOCS;
+        d = d + 1 < bits.length() ? bits.nextSetBit(d + 1) : DocIdSetIterator.NO_MORE_DOCS) {
+      out[n++] = d;
+    }
+    return out;
   }
 
   /** A field sort, natively, must give exactly Lucene's order (ties by doc id). */
@@ -387,7 +409,9 @@ public class TestLuxirSearch extends LuceneTestCase {
     Query full = LuxirSearch.withFilters(q, filters);
     String info = full + " sort " + sf;
     TopDocs expected = cs.search(full, new TopFieldCollectorManager(new Sort(sf), k, Integer.MAX_VALUE));
-    LuxirSearch.Result res = LuxirSearch.topKSorted(ls, q, filters, sf, k, null, false);
+    // without the match set, each segment's top k is kept as matches are found; with it, from its bits
+    boolean wantMatches = r.nextBoolean();
+    LuxirSearch.Result res = LuxirSearch.topKSorted(ls, q, filters, sf, k, null, wantMatches);
     assertNotNull(info + ": " + LuxirSearch.whyNotNative(ls, q, filters), res);
     assertEquals(info, expected.totalHits.value(), res.totalHits());
     assertEquals(info, expected.scoreDocs.length, res.docs().length);
@@ -401,6 +425,9 @@ public class TestLuxirSearch extends LuceneTestCase {
     if (res == null) return;
     FixedBitSet m = res.matches();
     String info = LuxirSearch.withFilters(q, filters).toString();
+    // the native facet paths take the matches as bits or as a sorted doc list
+    int[] matchDocs = docs(m);
+    DocMatches[] forms = {DocMatches.of(m), DocMatches.of(matchDocs, matchDocs.length)};
     List<LeafReaderContext> lux = ls.getIndexReader().leaves(), luc = cs.getIndexReader().leaves();
     for (int i = 0; i < lux.size(); i++) {
       LeafReaderContext a = lux.get(i), b = luc.get(i);
@@ -421,6 +448,34 @@ public class TestLuxirSearch extends LuceneTestCase {
         dense[0] = got.missing();
         for (int o = 0; o < got.ords().length; o++) dense[got.ords()[o] + 1] = got.counts()[o];
         assertArrayEquals(info + " " + f + " seg " + i, want, dense);
+        if (f.equals("kind")) {
+          // counts per ordinal and avg(year) per ordinal, collected natively from either form
+          int[] ordSlots = new int[n];
+          for (int o = 0; o < n; o++) ordSlots[o] = o;
+          NumericDocValues years = DocValues.getNumeric(b.reader(), "year");
+          SortedDocValues kinds = DocValues.getSorted(b.reader(), f);
+          double[] wantSum = new double[Math.max(1, n)];
+          int[] wantNum = new int[Math.max(1, n)];
+          for (int d = 0; d < b.reader().maxDoc(); d++) {
+            if (!m.get(b.docBase + d) || !kinds.advanceExact(d) || !years.advanceExact(d)) continue;
+            wantSum[kinds.ordValue()] += (int) years.longValue();
+            wantNum[kinds.ordValue()]++;
+          }
+          for (DocMatches form : forms) {
+            double[] sum = new double[Math.max(1, n)];
+            int[] num = new int[Math.max(1, n)];
+            NativeFacetCollector.Agg avg = new NativeFacetCollector.Agg(NativeFacetCollector.Op.AVG, "year",
+                NativeFacetCollector.ValueType.INT, sum, null, null, num, null);
+            long[] counts;
+            try (NativeFacetCollector c = new NativeFacetCollector(List.of(avg), -1, Math.max(1, n))) {
+              if (n > 0) c.collectOrds(a, form, f, ordSlots);
+              counts = c.finish();
+            }
+            for (int o = 0; o < n; o++) assertEquals(info + " " + f + " count " + o, want[o + 1], counts[o]);
+            assertArrayEquals(info + " avg sums", wantSum, sum, 0);
+            assertArrayEquals(info + " avg counts", wantNum, num);
+          }
+        }
       }
       for (String f : new String[] {"year", "ts", "pop"}) {
         NumericDocValues dv = DocValues.getNumeric(b.reader(), f);
@@ -441,7 +496,7 @@ public class TestLuxirSearch extends LuceneTestCase {
             missing++;
           }
         }
-        LuxirFacets.ValueCounts got = LuxirFacets.valueCounts(a, f, m, sample);
+        LuxirFacets.ValueCounts got = LuxirFacets.valueCounts(a, f, forms[r.nextInt(2)], sample);
         java.util.Map<Long, Integer> gotCounts = new java.util.HashMap<>();
         java.util.Map<Long, Integer> gotFirst = new java.util.HashMap<>();
         for (int j = 0; j < got.values().length; j++) {
