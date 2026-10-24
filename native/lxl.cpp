@@ -275,6 +275,7 @@ struct lxl_writer {
   std::vector<int32_t> normDocs;
   // current term, kept for endTerm
   std::string term;
+  std::array<char, PackedTerm::MAX_BYTES> packed;
   bool inTerm = false;
   // stored values (store mode), field ids rendered as names
   std::unique_ptr<StoredFieldsWriter> stored;
@@ -298,6 +299,14 @@ struct lxl_writer {
 };
 
 namespace {
+
+// A term for TextWriter::startTerm/endTerm, which copy what they keep: packed into the caller's
+// buffer, not the writer's pool (a pool copy per call takes the writer's lock and is never freed).
+PackedTerm packTerm(std::array<char, PackedTerm::MAX_BYTES>& buf, std::string_view term) {
+  assert(term.size() <= PackedTerm::MAX_LEN);
+  std::memcpy(buf.data() + 1, term.data(), term.size());
+  return PackedTerm(buf.data(), (uint32_t)term.size());
+}
 
 // NormsWriter::prepare/writeValues, fed from arrays instead of indexing streams.
 void prepareNorms(lxl_writer& w, const int32_t* docs, const uint8_t* values, int32_t n) {
@@ -429,7 +438,7 @@ int32_t lxl_writer_term(lxl_writer* w, const uint8_t* term, int32_t term_len,
     if (flags & LXL_TERM_START) {
       if (w->inTerm) return fail("lxl: term not ended");
       w->term.assign((const char*)term, (size_t)term_len);
-      tw.startTerm(w->pw->copyTerm(w->term));
+      tw.startTerm(packTerm(w->packed, w->term));
       w->inTerm = true;
     }
     if (!w->inTerm) return fail("lxl: term not started");
@@ -451,7 +460,7 @@ int32_t lxl_writer_term(lxl_writer* w, const uint8_t* term, int32_t term_len,
       tw.endDoc(doc);
     }
     if (flags & LXL_TERM_END) {
-      tw.endTerm(w->pw->copyTerm(w->term));
+      tw.endTerm(packTerm(w->packed, w->term));
       w->inTerm = false;
     }
     return 0;
@@ -1989,6 +1998,7 @@ int32_t lxl_writer_merge_field(lxl_writer* w, const char* name, int32_t name_len
       tw.startField(&fi);
       for (auto& s : src) s->live = s->te && s->te->nextTerm();
       std::string term;
+      std::array<char, PackedTerm::MAX_BYTES> buf;
       for (;;) {
         int32_t lowest = -1;
         for (int32_t i = 0; i < n; i++) {
@@ -1997,20 +2007,24 @@ int32_t lxl_writer_merge_field(lxl_writer* w, const char* name, int32_t name_len
         }
         if (lowest < 0) break;
         term.assign(std::string_view(src[lowest]->te->term()));
-        std::optional<PackedTerm> started;
+        std::optional<PackedTerm> started;  // packed in buf
         int32_t last = -1;
         for (int32_t i = 0; i < n; i++) {
           auto& s = *src[i];
           if (!s.live || std::string_view(s.te->term()) != term) continue;
           auto state = s.te->postingsState();
           state.termImpactFrontier = {};
-          DocsFreqEnum docs(state);
-          for (int32_t d = docs.nextDoc(); d != PostingsReader::END; d = docs.nextDoc()) {
+          // a term in one doc keeps it in the term dictionary (pulsed): no postings to decode
+          bool pulsed = state.docsStart == state.docsEnd;
+          std::optional<DocsFreqEnum> docs;
+          if (!pulsed) docs.emplace(state);
+          for (int32_t d = pulsed ? state.pulsedDoc : docs->nextDoc(); d != PostingsReader::END;
+               d = pulsed ? PostingsReader::END : docs->nextDoc()) {
             int32_t nd = s.map[d];
             if (nd < 0) continue;
             if (nd <= last) return fail("lxl: doc maps must increase across sources");
             if (!started) {
-              started = w->pw->copyTerm(term);
+              started = packTerm(buf, term);
               tw.startTerm(*started);
             }
             tw.addDoc(nd, 1);
@@ -2056,6 +2070,7 @@ int32_t lxl_writer_merge_field(lxl_writer* w, const char* name, int32_t name_len
       // k-way merge of the sources' term dictionaries (unsigned byte order)
       for (auto& s : src) s->live = s->te && s->te->nextTerm();
       std::string term;
+      std::array<char, PackedTerm::MAX_BYTES> buf;
       std::vector<uint64_t> withPostings((size_t)(w->pw->getMaxDoc() + 63) / 64);
       for (;;) {
         int32_t lowest = -1;
@@ -2071,13 +2086,30 @@ int32_t lxl_writer_merge_field(lxl_writer* w, const char* name, int32_t name_len
           if (!s.live || std::string_view(s.te->term()) != term) continue;
           auto state = s.te->postingsState();
           state.termImpactFrontier = {};
+          if (state.docsStart == state.docsEnd) {
+            // one doc and one position, kept in the term dictionary (pulsed): no postings to
+            // decode (most terms of a large text field, such as names)
+            int32_t nd = s.map[state.pulsedDoc];
+            if (nd >= 0) {
+              if (!started) {
+                tw.startTerm(packTerm(buf, term));
+                started = true;
+              }
+              tw.startDoc(nd);
+              withPostings[(size_t)nd >> 6] |= 1ULL << (nd & 63);
+              tw.addPositionDelta(state.pulsedPos);  // the position + 1: its delta from -1
+              tw.endDoc(nd);
+            }
+            s.live = s.te->nextTerm();
+            continue;
+          }
           DocsPosEnum docs(state);
           PosEnum pos(docs);
           for (int32_t d = docs.nextDoc(); d != PostingsReader::END; d = docs.nextDoc()) {
             int32_t nd = s.map[d];
             if (nd < 0) continue;
             if (!started) {
-              tw.startTerm(w->pw->copyTerm(term));
+              tw.startTerm(packTerm(buf, term));
               started = true;
             }
             tw.startDoc(nd);
@@ -2093,7 +2125,7 @@ int32_t lxl_writer_merge_field(lxl_writer* w, const char* name, int32_t name_len
           }
           s.live = s.te->nextTerm();
         }
-        if (started) tw.endTerm(w->pw->copyTerm(term));
+        if (started) tw.endTerm(packTerm(buf, term));
       }
       tw.endField();
       for (uint64_t word : withPostings) docCount += std::popcount(word);
@@ -3472,8 +3504,9 @@ int32_t lxl_writer_strings_postings(lxl_writer* w, int32_t ord) {
     fi.flags = FieldType::INDEX_DOCS;
     TextWriter tw(*w->pw);
     tw.startField(&fi);
+    std::array<char, PackedTerm::MAX_BYTES> buf;
     for (size_t r = 0; r < numTerms; r++) {
-      auto term = w->pw->copyTerm(sb.terms[(size_t)sb.byRank[r]]);
+      auto term = packTerm(buf, sb.terms[(size_t)sb.byRank[r]]);
       tw.startTerm(term);
       int32_t last = -1;
       for (int64_t k = start[r]; k < start[r + 1]; k++) {

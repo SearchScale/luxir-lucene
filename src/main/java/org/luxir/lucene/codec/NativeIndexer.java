@@ -138,7 +138,8 @@ final class NativeIndexer {
       offsets = Arrays.copyOf(offsets, size + 1);
     }
     int need = textLen + length;
-    if (need > text.length) text = Arrays.copyOf(text, ArrayUtil.oversize(need, 1));
+    // doubled: a batch fills up to BATCH_BYTES, so 1/8 steps would copy it dozens of times
+    if (need > text.length) text = Arrays.copyOf(text, Math.max(need, text.length * 2));
     System.arraycopy(utf8, offset, text, textLen, length);
     docs[n] = doc;
     fieldOrds[n] = ord;
@@ -170,7 +171,7 @@ final class NativeIndexer {
       sOffsets = Arrays.copyOf(sOffsets, size + 1);
     }
     int need = sLen + length;
-    if (need > sBytes.length) sBytes = Arrays.copyOf(sBytes, ArrayUtil.oversize(need, 1));
+    if (need > sBytes.length) sBytes = Arrays.copyOf(sBytes, Math.max(need, sBytes.length * 2));
     System.arraycopy(utf8, offset, sBytes, sLen, length);
     sDocs[sn] = doc;
     sOrds[sn] = ord;
