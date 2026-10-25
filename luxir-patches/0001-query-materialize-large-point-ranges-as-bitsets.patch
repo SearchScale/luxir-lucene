@@ -1,22 +1,22 @@
-From e8bb64bc54ffcd8bb9766909383dbb9a759fed8f Mon Sep 17 00:00:00 2001
+From 970e24bcf5c70dc5e7ce5fa4c61f4a7f6e97a2aa Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@apache.org>
 Date: Tue, 20 Oct 2026 19:36:48 +0530
-Subject: [PATCH 1/4] query: materialize large point ranges as bitsets
+Subject: [PATCH 1/5] query: materialize large point ranges as bitsets
 
 A range gathered into a doc array has to be sorted, which costs several
 times as much per doc as setting a bit. The array limit drops from
-maxDoc/32 to maxDoc/1024, with at least 256 docs and never more than
-maxDoc/32, so a large range builds a bitset instead of sorting hundreds
-of thousands of doc ids.
+maxDoc/128 to maxDoc/1024, with at least 256 docs and never more than
+maxDoc/32, so a large range builds a bitset instead of sorting tens of
+thousands of doc ids.
 ---
- src/luxir/query/PointsMaterialize.h | 8 +++++++-
- 1 file changed, 7 insertions(+), 1 deletion(-)
+ src/luxir/query/PointsMaterialize.h | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
 
 diff --git a/src/luxir/query/PointsMaterialize.h b/src/luxir/query/PointsMaterialize.h
-index ef8643c2..a5f29b9f 100644
+index 38c944bd..a5f29b9f 100644
 --- a/src/luxir/query/PointsMaterialize.h
 +++ b/src/luxir/query/PointsMaterialize.h
-@@ -20,8 +20,14 @@ struct PointsMaterialize {
+@@ -20,10 +20,14 @@ struct PointsMaterialize {
      uint64_t* words = nullptr;
    };
  
@@ -26,7 +26,9 @@ index ef8643c2..a5f29b9f 100644
 +  // docs sort in microseconds, so up to that many (but never past maxDoc / 32, where the array
 +  // outgrows the bitset) stay an array.
    static uint64_t arrayLimit(int32_t maxDoc) {
--    return ((uint64_t)(uint32_t)maxDoc + 31) >> 5;
+-    // Point traversal emits docids in value order. Switch before the memory
+-    // break-even (maxDoc/32) to avoid sorting moderately sparse result sets.
+-    return ((uint64_t)(uint32_t)maxDoc + 127) >> 7;
 +    uint64_t docs = (uint64_t)(uint32_t)maxDoc;
 +    return std::max((docs + 1023) >> 10, std::min<uint64_t>(256, (docs + 31) >> 5));
    }

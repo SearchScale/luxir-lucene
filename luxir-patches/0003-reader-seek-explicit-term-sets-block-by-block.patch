@@ -1,7 +1,7 @@
-From 57a3e5bd846dc6391ce8a2112cd91dc30e6f15f6 Mon Sep 17 00:00:00 2001
+From 346acaf964ebd8155ec6d3d082e6f848f1bdcfc3 Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@apache.org>
 Date: Tue, 20 Oct 2026 19:36:48 +0530
-Subject: [PATCH 3/4] reader: seek explicit term sets block by block
+Subject: [PATCH 3/5] reader: seek explicit term sets block by block
 
 ExplicitTermsEnum now does one forward exact seek per requested term.
 TermsEnum::blockFor finds the term's block through a TrieReader::Cursor

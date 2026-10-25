@@ -1,8 +1,8 @@
-From 173ec3241f6a64ca1d3d9a1d9fb8d910210d344f Mon Sep 17 00:00:00 2001
+From 93a50f1f758361d04abbdfd14507e7220b4f5396 Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@searchscale.com>
 Date: Sun, 25 Oct 2026 02:55:08 +0530
-Subject: [PATCH] index: scan and clear only the norms a term's impact surfaces
- use
+Subject: [PATCH 5/5] index: scan and clear only the norms a term's impact
+ surfaces use
 
 Every term zeroed four 256-slot (norm -> maxTf) surfaces and the L1 block arrays at start, and its
 frontiers scanned all 256 slots: two scans for a single-doc term's one-point frontier, eight for a
