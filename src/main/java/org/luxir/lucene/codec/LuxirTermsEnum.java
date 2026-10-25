@@ -10,17 +10,11 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.ref.Reference;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
 import org.apache.lucene.index.BaseTermsEnum;
 import org.apache.lucene.index.ImpactsEnum;
 import org.apache.lucene.index.PostingsEnum;
 import org.apache.lucene.index.SlowImpactsEnum;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.automaton.Automaton;
-import org.apache.lucene.util.automaton.CompiledAutomaton;
-import org.apache.lucene.util.automaton.Transition;
 import org.luxir.lucene.LxlNative;
 
 /**
@@ -32,55 +26,9 @@ import org.luxir.lucene.LxlNative;
  * followed by a reachability fence on {@code this}.
  */
 final class LuxirTermsEnum extends BaseTermsEnum {
-  /** A deterministic byte automaton in the form lxl_intersect_new takes. */
-  record Dfa(byte[] accepts, int[] offsets, int[] ranges, byte[] prefix, int initialState, byte[] suffix,
-      byte[] startAfter) {
-    static Dfa of(CompiledAutomaton compiled, BytesRef startTerm) {
-      Automaton a = compiled.automaton;
-      int n = a.getNumStates();
-      if (n == 0) return null;
-      byte[] accepts = new byte[n];
-      int[] offsets = new int[n + 1];
-      List<int[]> all = new ArrayList<>();
-      Transition t = new Transition();
-      for (int s = 0; s < n; s++) {
-        accepts[s] = (byte) (a.isAccept(s) ? 1 : 0);
-        int count = a.initTransition(s, t);
-        int[][] st = new int[count][];
-        for (int i = 0; i < count; i++) {
-          a.getNextTransition(t);
-          if (t.min < 0 || t.max > 255) return null;
-          st[i] = new int[] {t.min, t.max, t.dest};
-        }
-        Arrays.sort(st, (x, y) -> Integer.compare(x[0], y[0]));
-        for (int[] r : st) all.add(r);
-        offsets[s + 1] = all.size();
-      }
-      int[] ranges = new int[all.size() * 3];
-      for (int i = 0; i < all.size(); i++) System.arraycopy(all.get(i), 0, ranges, 3 * i, 3);
-      // Fixed prefix: follow single-byte, non-accepting states from the start.
-      byte[] prefix = new byte[LxlNative.MAX_TERM];
-      int plen = 0, state = 0;
-      while (plen < LxlNative.MAX_TERM && accepts[state] == 0 && offsets[state + 1] - offsets[state] == 1) {
-        int r = offsets[state];
-        if (ranges[3 * r] != ranges[3 * r + 1]) break;
-        prefix[plen++] = (byte) ranges[3 * r];
-        state = ranges[3 * r + 2];
-      }
-      BytesRef cs = compiled.commonSuffixRef;
-      byte[] suffix = cs == null ? new byte[0] : Arrays.copyOfRange(cs.bytes, cs.offset, cs.offset + cs.length);
-      // The native dictionary holds terms of at most MAX_TERM bytes; for those, sorting after a longer
-      // start term is sorting after its first MAX_TERM bytes (a term equal to them is a prefix of it).
-      byte[] startAfter = startTerm == null ? null
-          : Arrays.copyOfRange(startTerm.bytes, startTerm.offset,
-              startTerm.offset + Math.min(startTerm.length, LxlNative.MAX_TERM));
-      return new Dfa(accepts, offsets, ranges, Arrays.copyOf(prefix, plen), state, suffix, startAfter);
-    }
-  }
-
   private final LuxirFieldsProducer producer;
   private final byte[] fieldBytes;
-  private final Dfa dfa; // null: a full dictionary enum
+  private final LuxirDfa dfa; // null: a full dictionary enum
   private final NativeHandle handle;
   private final byte[] termBuf = new byte[LxlNative.MAX_TERM];
   private final BytesRef term = new BytesRef(termBuf, 0, 0);
@@ -93,7 +41,7 @@ final class LuxirTermsEnum extends BaseTermsEnum {
     this(producer, field, null, false);
   }
 
-  LuxirTermsEnum(LuxirFieldsProducer producer, String field, Dfa dfa, boolean docsOnly) {
+  LuxirTermsEnum(LuxirFieldsProducer producer, String field, LuxirDfa dfa, boolean docsOnly) {
     this.producer = producer;
     this.docsOnly = docsOnly;
     this.fieldBytes = field.getBytes(StandardCharsets.UTF_8);

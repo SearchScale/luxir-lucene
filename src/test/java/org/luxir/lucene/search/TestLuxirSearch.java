@@ -43,6 +43,7 @@ import org.apache.lucene.index.LogDocMergePolicy;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SerialMergeScheduler;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.search.AutomatonQuery;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BoostQuery;
@@ -575,6 +576,9 @@ public class TestLuxirSearch extends LuceneTestCase {
     // one-call top-k + exact count + match set (null: shape not supported natively)
     LuxirSearch.Result res = LuxirSearch.topK(ls, q, 10, null, true);
     if (q instanceof PhraseQuery pq && pq.getSlop() > 0) assertNotNull(info + ": sloppy phrases run natively", res);
+    if ((q instanceof WildcardQuery || q instanceof RegexpQuery) && ((AutomatonQuery) q).getField().equals("title")) {
+      assertNotNull(info + ": automata run natively", res);
+    }
     if (q instanceof SpanNearQuery sn && distinctTerms(sn)) assertNotNull(info + ": ordered spans run natively", res);
     if (res == null) return false;
     assertEquals(info, expected.totalHits.value(), res.totalHits());
@@ -666,9 +670,10 @@ public class TestLuxirSearch extends LuceneTestCase {
         case 0:
           return new PrefixQuery(new Term("body", w.substring(0, Math.min(w.length(), 2))));
         case 1:
-          return new WildcardQuery(new Term("body", "w?" + w.charAt(w.length() - 1) + "*"));
+          // title has no overflow terms, so its automata always run natively
+          return new WildcardQuery(new Term(r.nextBoolean() ? "title" : "body", "w?" + w.charAt(w.length() - 1) + "*"));
         case 2:
-          return new RegexpQuery(new Term("body", "w[0-9a-c][a-z0-9]?"));
+          return new RegexpQuery(new Term(r.nextBoolean() ? "title" : "body", "w[0-9a-c][a-z0-9]?"));
         default:
           return new FuzzyQuery(new Term("body", w), 1 + r.nextInt(2));
       }

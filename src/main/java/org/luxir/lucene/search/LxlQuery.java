@@ -30,11 +30,11 @@ import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.PhraseQuery;
 import org.apache.lucene.search.PointInSetQuery;
-import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.PointRangeQuery;
 import org.apache.lucene.search.PrefixQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
+import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TermStatistics;
 import org.apache.lucene.search.similarities.BM25Similarity;
@@ -42,7 +42,9 @@ import org.apache.lucene.search.similarities.PerFieldSimilarityWrapper;
 import org.apache.lucene.search.similarities.Similarity;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.ByteRunAutomaton;
+import org.apache.lucene.util.automaton.CompiledAutomaton;
 import org.luxir.lucene.LxlNative;
+import org.luxir.lucene.codec.LuxirDfa;
 
 /**
  * Encodes a rewritten Lucene query for native execution, carrying the searcher's collection-wide
@@ -63,7 +65,8 @@ import org.luxir.lucene.LxlNative;
  * clause (slot, score): the caller's per-segment bitset for {@link Encoded#ranges()}[slot], 10
  * numeric range (slot, lo, hi) over the caller's per-segment doc-values column [slot], 11
  * constant-score term set (field, n, then n sorted unique terms), 12 ordered span near (field, slop,
- * n, then n x (term, docFreq, ttf)). Strings are an int length and bytes.
+ * n, then n x (term, docFreq, ttf)), 13 constant-score byte DFA (field, states, accept flags,
+ * states + 1 range offsets, (min, max, dest) ranges, prefix, initial state, suffix). Strings are an int length and bytes.
  */
 public final class LxlQuery {
   private static final int MAGIC = 0x3151584c; // "LXQ1"
@@ -182,19 +185,22 @@ public final class LxlQuery {
     if (q instanceof TermQuery tq) {
       Term t = tq.getTerm();
       if (!field(t.field()) || t.bytes().length > LxlNative.MAX_TERM) return false;
+      // Rewrites such as fuzzy's blended scoring attach their own (adjusted) statistics; Lucene's
+      // TermWeight uses them when they were built for this searcher.
+      TermStates states = tq.getTermStates();
+      if (states != null && !states.wasBuiltFor(searcher.getTopReaderContext())) states = null;
       if (scores && docsOnly(t.field())) {
         // Docs-only, norm-free terms (Luxir value strings) score the same in every matching doc
         // (freq 1, norm 1): Lucene's own similarity computes that score; Luxir matches the term.
+        // The statistics are built once, for the score and the term node.
+        if (states == null) states = TermStates.build(searcher, t, true);
         body.write(5);
-        f32(docsOnlyScore(tq));
+        f32(docsOnlyScore(t, states));
       }
       body.write(1);
       str(t.field().getBytes(StandardCharsets.UTF_8));
       bytes(t.bytes());
-      // Rewrites such as fuzzy's blended scoring attach their own (adjusted) statistics; Lucene's
-      // TermWeight uses them when they were built for this searcher.
-      TermStates states = tq.getTermStates();
-      if (states != null && states.wasBuiltFor(searcher.getTopReaderContext())) {
+      if (states != null) {
         termStats(t, states);
       } else {
         termStats(t);
@@ -252,10 +258,30 @@ public final class LxlQuery {
     }
     AutomatonQuery automaton = constantScoreAutomaton(q);
     if (automaton != null && !(automaton instanceof PrefixQuery)) {
-      // Lucene's constant-score rewrite of a wildcard/regexp: the union of the matching terms,
-      // expanded through each segment's terms (Luxir's own DFA walk), scoring 1
       String f = automaton.getField();
       if (!field(f)) return false;
+      CompiledAutomaton compiled = automaton.getCompiled();
+      LuxirDfa dfa = compiled.type == CompiledAutomaton.AUTOMATON_TYPE.NORMAL && compiled.automaton != null
+          && compiled.automaton.isDeterministic() ? LuxirDfa.of(compiled, null) : null;
+      if (dfa != null) {
+        // Lucene's constant-score rewrite of a wildcard/regexp: Luxir's automaton query walks each
+        // segment's terms with the same DFA, scoring 1. A segment with overflow terms in the field
+        // (which the native walk cannot see) runs in Lucene.
+        body.write(13);
+        str(f.getBytes(StandardCharsets.UTF_8));
+        int n = dfa.accepts().length;
+        i32(n);
+        str(dfa.accepts());
+        for (int o : dfa.offsets()) i32(o);
+        for (int r : dfa.ranges()) i32(r);
+        str(dfa.prefix());
+        i32(dfa.initialState());
+        str(dfa.suffix());
+        prefixes.add(Map.entry(f, new byte[0]));
+        return true;
+      }
+      // otherwise the union of the matching terms, expanded through each segment's terms (Luxir's
+      // own DFA walk), scoring 1
       java.util.TreeSet<BytesRef> terms = new java.util.TreeSet<>();
       for (org.apache.lucene.index.LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
         org.apache.lucene.index.Terms t = ctx.reader().terms(f);
@@ -525,12 +551,7 @@ public final class LxlQuery {
   }
 
   /** Lucene's score of a docs-only term in any matching doc (freq 1, norm 1), boost 1. */
-  private float docsOnlyScore(TermQuery tq) throws IOException {
-    Term t = tq.getTerm();
-    TermStates states = tq.getTermStates();
-    if (states == null || !states.wasBuiltFor(searcher.getTopReaderContext())) {
-      states = TermStates.build(searcher, t, true);
-    }
+  private float docsOnlyScore(Term t, TermStates states) throws IOException {
     if (states.docFreq() == 0) return 0f;
     TermStatistics ts = searcher.termStatistics(t, states.docFreq(), states.totalTermFreq());
     CollectionStatistics cs = searcher.collectionStatistics(t.field());

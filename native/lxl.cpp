@@ -44,6 +44,7 @@
 #include "luxir/index/PostingsWriter.h"
 #include "luxir/index/StoredFieldsWriter.h"
 #include "luxir/query/AllQuery.h"
+#include "luxir/query/AutomatonQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
@@ -799,8 +800,24 @@ int32_t lxl_terms_seek_ord(lxl_terms* t, int64_t ord, uint8_t* term_out, int64_t
 
 // ---- automaton intersection --------------------------------------------------------------
 
+// The dense transition table (state x byte) Luxir's ByteDfa builds for a DFA whose table fits in
+// 128 KB, which makes each step one load; null when it does not fit.
+static int16_t* denseTable(MemPool& pool, const automaton::ByteDfaRange* ranges, const uint32_t* offsets,
+                    uint32_t numStates) {
+  if ((size_t)numStates * 256 * sizeof(int16_t) > 128 * 1024) return nullptr;
+  int16_t* table = pool.make_arr<int16_t>((size_t)numStates * 256);
+  std::fill_n(table, (size_t)numStates * 256, (int16_t)automaton::ByteDfaView::DEAD);
+  for (uint32_t s = 0; s < numStates; s++) {
+    for (uint32_t r = offsets[s]; r < offsets[s + 1]; r++) {
+      for (int32_t b = ranges[r].min; b <= ranges[r].max; b++) table[(size_t)s * 256 + (size_t)b] = (int16_t)ranges[r].dest;
+    }
+  }
+  return table;
+}
+
 struct lxl_intersect {
   std::unique_ptr<lxl_terms> terms;
+  MemPool tablePool;
   std::vector<automaton::ByteDfaRange> ranges;
   std::vector<uint32_t> offsets;
   std::vector<uint8_t> accepts;
@@ -837,7 +854,8 @@ lxl_intersect* lxl_intersect_new(lxl_reader* r, const char* field, int32_t field
     }
     x->prefix.assign((const char*)prefix, (size_t)prefix_len);
     x->suffix.assign((const char*)suffix, (size_t)suffix_len);
-    automaton::ByteDfaView view(x->ranges.data(), x->offsets.data(), x->accepts.data(), nullptr,
+    automaton::ByteDfaView view(x->ranges.data(), x->offsets.data(), x->accepts.data(),
+                                denseTable(x->tablePool, x->ranges.data(), x->offsets.data(), (uint32_t)num_states),
                                 (uint32_t)num_states);
     DfaScanPlan plan{x->prefix, x->suffix, initial_state};
     if (start_after_len >= 0) {
@@ -1407,6 +1425,39 @@ struct QueryParser {
         }
         return pool.make<PhraseQuery>(field, std::span<std::string_view>(words, (size_t)n),
                                       std::span<const int32_t>(positions, (size_t)n), slop, true);
+      }
+      case 13: {  // constant-score byte DFA (a wildcard/regexp), walked over each segment's terms
+        std::string_view field = this->field();
+        const char* keyStart = p;
+        int32_t n = get<int32_t>();
+        std::string_view accepts = str();
+        if (n <= 0 || accepts.size() != (size_t)n) throw std::invalid_argument("lxl: bad automaton");
+        auto* offsets = pool.make_arr<uint32_t>((size_t)n + 1);
+        for (int32_t i = 0; i <= n; i++) {
+          int32_t o = get<int32_t>();
+          if (o < 0 || (i == 0 ? o != 0 : (uint32_t)o < offsets[i - 1])) throw std::invalid_argument("lxl: bad automaton");
+          offsets[i] = (uint32_t)o;
+        }
+        auto* ranges = pool.make_arr<automaton::ByteDfaRange>(offsets[n]);
+        for (uint32_t i = 0; i < offsets[n]; i++) {
+          int32_t lo = get<int32_t>(), hi = get<int32_t>(), dest = get<int32_t>();
+          if (lo < 0 || hi > 255 || lo > hi || dest < 0 || dest >= n) {
+            throw std::invalid_argument("lxl: bad automaton transition");
+          }
+          ranges[i] = {(uint8_t)lo, (uint8_t)hi, dest};
+        }
+        std::string_view prefix = str();
+        int32_t initial = get<int32_t>();
+        std::string_view suffix = str();
+        if (initial < 0 || initial >= n || prefix.size() > LXL_MAX_TERM) throw std::invalid_argument("lxl: bad automaton");
+        // The encoded automaton is the query's identity (its cache keys and equality).
+        std::string_view key(keyStart, (size_t)(p - keyStart));
+        automaton::ByteDfaView view(ranges, offsets, (const uint8_t*)accepts.data(),
+                                    denseTable(pool, ranges, offsets, (uint32_t)n), (uint32_t)n);
+        DfaScanPlan plan{prefix, suffix, initial};
+        auto* q = pool.make<AutomatonQuery>(field, AutomatonQuery::Kind::REGEX, false, key, view,
+                                            automaton::ByteDfaKind::NORMAL, std::string_view(), plan);
+        return pool.make<ConstantScoreQuery>(q, 1.0f);
       }
       case 4: {  // boost
         float boost = get<float>();

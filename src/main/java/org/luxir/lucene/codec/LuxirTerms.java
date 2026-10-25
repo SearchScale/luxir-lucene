@@ -72,7 +72,7 @@ public final class LuxirTerms extends Terms implements Supplier<MemorySegment>, 
       return super.intersect(compiled, startTerm);
     }
     producer.ensureOpen();
-    LuxirTermsEnum.Dfa dfa = LuxirTermsEnum.Dfa.of(compiled, startTerm);
+    LuxirDfa dfa = LuxirDfa.of(compiled, startTerm);
     if (dfa == null) return super.intersect(compiled, startTerm);
     LuxirTermsEnum terms = new LuxirTermsEnum(producer, stats.name(), dfa, docsOnly);
     return overflow.isEmpty() ? terms : new MergedTermsEnum(terms, overflow.new Enum(compiled, startTerm));
