@@ -104,13 +104,24 @@ final class OverflowTerms {
     return new OverflowTerms(terms, docs, freqs, positions);
   }
 
-  /** Enumerates the overflow terms, optionally only those an automaton accepts. */
+  /**
+   * Enumerates the overflow terms, optionally only those an automaton accepts after a start term
+   * (exclusive), as Terms.intersect does.
+   */
   final class Enum extends BaseTermsEnum {
     private final CompiledAutomaton filter;
     private int i = -1;
 
     Enum(CompiledAutomaton filter) {
+      this(filter, null);
+    }
+
+    Enum(CompiledAutomaton filter, BytesRef startAfter) {
       this.filter = filter;
+      if (startAfter != null) {
+        int idx = Arrays.binarySearch(terms, startAfter);
+        i = idx >= 0 ? idx : -idx - 2;
+      }
     }
 
     private boolean accepted(int idx) {

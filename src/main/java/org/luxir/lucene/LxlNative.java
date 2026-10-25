@@ -222,7 +222,7 @@ public final class LxlNative {
   public static final MethodHandle INTERSECT_NEW =
       fn("lxl_intersect_new",
           FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
-              JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT),
+              JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT),
           CRITICAL);
   public static final MethodHandle INTERSECT_NEXT =
       fn("lxl_intersect_next", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), CRITICAL);

@@ -65,18 +65,17 @@ public final class LuxirTerms extends Terms implements Supplier<MemorySegment>, 
   /** Native DFA intersection for deterministic automata; Lucene's generic walk otherwise. */
   @Override
   public TermsEnum intersect(CompiledAutomaton compiled, BytesRef startTerm) throws IOException {
-    if (startTerm != null
-        || compiled.type != CompiledAutomaton.AUTOMATON_TYPE.NORMAL
+    if (compiled.type != CompiledAutomaton.AUTOMATON_TYPE.NORMAL
         || compiled.runAutomaton == null
         || compiled.automaton == null
         || !compiled.automaton.isDeterministic()) {
       return super.intersect(compiled, startTerm);
     }
     producer.ensureOpen();
-    LuxirTermsEnum.Dfa dfa = LuxirTermsEnum.Dfa.of(compiled);
+    LuxirTermsEnum.Dfa dfa = LuxirTermsEnum.Dfa.of(compiled, startTerm);
     if (dfa == null) return super.intersect(compiled, startTerm);
     LuxirTermsEnum terms = new LuxirTermsEnum(producer, stats.name(), dfa, docsOnly);
-    return overflow.isEmpty() ? terms : new MergedTermsEnum(terms, overflow.new Enum(compiled));
+    return overflow.isEmpty() ? terms : new MergedTermsEnum(terms, overflow.new Enum(compiled, startTerm));
   }
 
   @Override

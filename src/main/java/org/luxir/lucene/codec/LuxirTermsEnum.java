@@ -33,8 +33,9 @@ import org.luxir.lucene.LxlNative;
  */
 final class LuxirTermsEnum extends BaseTermsEnum {
   /** A deterministic byte automaton in the form lxl_intersect_new takes. */
-  record Dfa(byte[] accepts, int[] offsets, int[] ranges, byte[] prefix, int initialState, byte[] suffix) {
-    static Dfa of(CompiledAutomaton compiled) {
+  record Dfa(byte[] accepts, int[] offsets, int[] ranges, byte[] prefix, int initialState, byte[] suffix,
+      byte[] startAfter) {
+    static Dfa of(CompiledAutomaton compiled, BytesRef startTerm) {
       Automaton a = compiled.automaton;
       int n = a.getNumStates();
       if (n == 0) return null;
@@ -68,7 +69,12 @@ final class LuxirTermsEnum extends BaseTermsEnum {
       }
       BytesRef cs = compiled.commonSuffixRef;
       byte[] suffix = cs == null ? new byte[0] : Arrays.copyOfRange(cs.bytes, cs.offset, cs.offset + cs.length);
-      return new Dfa(accepts, offsets, ranges, Arrays.copyOf(prefix, plen), state, suffix);
+      // The native dictionary holds terms of at most MAX_TERM bytes; for those, sorting after a longer
+      // start term is sorting after its first MAX_TERM bytes (a term equal to them is a prefix of it).
+      byte[] startAfter = startTerm == null ? null
+          : Arrays.copyOfRange(startTerm.bytes, startTerm.offset,
+              startTerm.offset + Math.min(startTerm.length, LxlNative.MAX_TERM));
+      return new Dfa(accepts, offsets, ranges, Arrays.copyOf(prefix, plen), state, suffix, startAfter);
     }
   }
 
@@ -107,7 +113,9 @@ final class LuxirTermsEnum extends BaseTermsEnum {
         } else {
           p = check((MemorySegment) LxlNative.INTERSECT_NEW.invokeExact(producer.nativeReader(), heap(fieldBytes),
               fieldBytes.length, dfa.accepts().length, heap(dfa.accepts()), heap(dfa.offsets()), heap(dfa.ranges()),
-              heap(dfa.prefix()), dfa.prefix().length, heap(dfa.suffix()), dfa.suffix().length, dfa.initialState()));
+              heap(dfa.prefix()), dfa.prefix().length, heap(dfa.suffix()), dfa.suffix().length, dfa.initialState(),
+              heap(dfa.startAfter() == null ? new byte[0] : dfa.startAfter()),
+              dfa.startAfter() == null ? -1 : dfa.startAfter().length));
         }
       } catch (Throwable t) {
         throw LxlNative.rethrow(t);

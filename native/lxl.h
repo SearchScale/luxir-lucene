@@ -148,13 +148,16 @@ typedef struct lxl_intersect lxl_intersect;
 /* A byte DFA: num_states accept flags, per-state offsets (num_states + 1) into
  * ranges (min, max, dest triples sorted by min). prefix: bytes every accepted
  * term starts with; initial_state: the DFA state after the prefix. suffix:
- * bytes every accepted term ends with (may be empty). */
+ * bytes every accepted term ends with (may be empty). start_after: when
+ * start_after_len >= 0, only accepted terms sorting strictly after these bytes
+ * are returned; -1 for none. */
 LXL_API lxl_intersect* lxl_intersect_new(lxl_reader* r, const char* field, int32_t field_len,
                                          int32_t num_states, const uint8_t* accepts,
                                          const int32_t* offsets, const int32_t* ranges,
                                          const uint8_t* prefix, int32_t prefix_len,
                                          const uint8_t* suffix, int32_t suffix_len,
-                                         int32_t initial_state);
+                                         int32_t initial_state,
+                                         const uint8_t* start_after, int32_t start_after_len);
 /* Next accepted term, as lxl_terms_next. */
 LXL_API int32_t lxl_intersect_next(lxl_intersect* it, uint8_t* term_out, int64_t* stats);
 /* The terms enum positioned on the current term (for lxl_postings_new); owned by it. */

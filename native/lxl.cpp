@@ -804,7 +804,7 @@ struct lxl_intersect {
   std::vector<automaton::ByteDfaRange> ranges;
   std::vector<uint32_t> offsets;
   std::vector<uint8_t> accepts;
-  std::string prefix, suffix;
+  std::string prefix, suffix, startAfter;
   std::unique_ptr<DfaIntersectEnum> it;
 };
 
@@ -815,7 +815,8 @@ lxl_intersect* lxl_intersect_new(lxl_reader* r, const char* field, int32_t field
                                  const int32_t* offsets, const int32_t* ranges,
                                  const uint8_t* prefix, int32_t prefix_len,
                                  const uint8_t* suffix, int32_t suffix_len,
-                                 int32_t initial_state) {
+                                 int32_t initial_state,
+                                 const uint8_t* start_after, int32_t start_after_len) {
   return guardedPtr<lxl_intersect>([&]() -> lxl_intersect* {
     std::unique_ptr<lxl_terms> terms(lxl_terms_new(r, field, field_len));
     if (!terms) throw std::invalid_argument("lxl: field not in this segment");
@@ -823,6 +824,7 @@ lxl_intersect* lxl_intersect_new(lxl_reader* r, const char* field, int32_t field
       throw std::invalid_argument("lxl: bad automaton");
     }
     if (prefix_len > LXL_MAX_TERM) throw std::invalid_argument("lxl: automaton prefix too long");
+    if (start_after_len > LXL_MAX_TERM) throw std::invalid_argument("lxl: start term too long");
     auto x = std::make_unique<lxl_intersect>();
     x->accepts.assign(accepts, accepts + num_states);
     x->offsets.assign(offsets, offsets + num_states + 1);
@@ -838,6 +840,10 @@ lxl_intersect* lxl_intersect_new(lxl_reader* r, const char* field, int32_t field
     automaton::ByteDfaView view(x->ranges.data(), x->offsets.data(), x->accepts.data(), nullptr,
                                 (uint32_t)num_states);
     DfaScanPlan plan{x->prefix, x->suffix, initial_state};
+    if (start_after_len >= 0) {
+      x->startAfter.assign((const char*)start_after, (size_t)start_after_len);
+      plan.startAfter = x->startAfter;
+    }
     x->terms = std::move(terms);
     x->it = std::make_unique<DfaIntersectEnum>(x->terms->pool, *x->terms->te, view, plan);
     return x.release();
