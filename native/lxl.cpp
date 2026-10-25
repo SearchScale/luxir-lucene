@@ -1386,6 +1386,28 @@ struct QueryParser {
         return pool.make<PhraseQuery>(field, std::span<std::string_view>(words, (size_t)n),
                                       std::span<const int32_t>(positions, (size_t)n), slop);
       }
+      case 12: {  // ordered span near over single distinct terms (Lucene's SpanNearQuery)
+        std::string_view field = this->field();
+        int32_t slop = get<int32_t>();
+        int32_t n = get<int32_t>();
+        if (n < 2) throw std::invalid_argument("lxl: span near needs two terms");
+        if (slop < 0) throw std::invalid_argument("lxl: bad span slop");
+        auto* words = pool.make_arr<std::string_view>((size_t)n);
+        auto* positions = pool.make_arr<int32_t>((size_t)n);
+        for (int32_t i = 0; i < n; i++) {
+          positions[i] = i;
+          words[i] = str();
+          for (int32_t j = 0; j < i; j++) {
+            if (words[j] == words[i]) throw std::invalid_argument("lxl: repeated span term");
+          }
+          Similarity::TermStats s;
+          s.docFreq = get<int64_t>();
+          s.totalTermFreq = get<int64_t>();
+          terms.push_back({field, words[i], s});
+        }
+        return pool.make<PhraseQuery>(field, std::span<std::string_view>(words, (size_t)n),
+                                      std::span<const int32_t>(positions, (size_t)n), slop, true);
+      }
       case 4: {  // boost
         float boost = get<float>();
         return pool.make<BoostQuery>(node(), boost);

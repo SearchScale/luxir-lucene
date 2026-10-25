@@ -49,7 +49,8 @@ import org.luxir.lucene.LxlNative;
  * BM25 statistics so native scores equal Lucene's.
  *
  * <p>Supported: TermQuery, BooleanQuery (any occurs and minimumShouldMatch, not purely negative),
- * BoostQuery, ConstantScoreQuery, exact PhraseQuery, MatchAll/MatchNoDocsQuery, constant-score prefix, over fields scored by
+ * BoostQuery, ConstantScoreQuery, PhraseQuery, ordered SpanNearQuery of single distinct terms,
+ * MatchAll/MatchNoDocsQuery, constant-score prefix, over fields scored by
  * BM25Similarity(1.2, 0.75); and, where the caller evaluates them ({@code ranges}), one-dimensional
  * point ranges (PointRangeQuery, alone or as IndexOrDocValuesQuery's index side) as constant-score
  * bitset clauses. Anything else returns null and the caller uses Lucene.
@@ -61,8 +62,8 @@ import org.luxir.lucene.LxlNative;
  * 6 match nothing, 7 match all, 8 constant-score prefix (field, prefix), 9 constant-score bitset
  * clause (slot, score): the caller's per-segment bitset for {@link Encoded#ranges()}[slot], 10
  * numeric range (slot, lo, hi) over the caller's per-segment doc-values column [slot], 11
- * constant-score term set (field, n, then n sorted unique terms). Strings are an int length and
- * bytes.
+ * constant-score term set (field, n, then n sorted unique terms), 12 ordered span near (field, slop,
+ * n, then n x (term, docFreq, ttf)). Strings are an int length and bytes.
  */
 public final class LxlQuery {
   private static final int MAGIC = 0x3151584c; // "LXQ1"
@@ -384,12 +385,29 @@ public final class LxlQuery {
       f32(1f);
       return node(c.getQuery());
     }
+    if (LxlSpans.AVAILABLE) {
+      LxlSpans.OrderedNear near = LxlSpans.orderedTermNear(q);
+      if (near != null) {
+        // Lucene's ordered SpanNearQuery of single distinct terms (Solr's {!complexphrase}):
+        // Luxir's phrase scorer with Lucene's NearSpansOrdered matching and span frequency
+        if (!field(near.field())) return false;
+        body.write(12);
+        str(near.field().getBytes(StandardCharsets.UTF_8));
+        i32(near.slop());
+        i32(near.terms().length);
+        for (Term t : near.terms()) {
+          if (t.bytes().length > LxlNative.MAX_TERM) return false;
+          bytes(t.bytes());
+          termStats(t);
+        }
+        return true;
+      }
+    }
     if (q instanceof PhraseQuery pq) {
       Term[] terms = pq.getTerms();
-      // Sloppy phrases match the same documents, but Lucene's sloppy frequency is a heuristic
-      // that Luxir's matcher does not reproduce exactly (it can find a closer match), so their
-      // scores can differ: leave them to Lucene.
-      if (terms.length < 2 || pq.getSlop() != 0 || !field(pq.getField())) return false;
+      // Sloppy phrases too: Luxir's sloppy matcher follows Lucene's SloppyPhraseMatcher (match
+      // lengths, repeated terms, frequency 1 / (1 + length)), so the scores are the same.
+      if (terms.length < 2 || !field(pq.getField())) return false;
       int[] positions = pq.getPositions();
       body.write(3);
       str(pq.getField().getBytes(StandardCharsets.UTF_8));

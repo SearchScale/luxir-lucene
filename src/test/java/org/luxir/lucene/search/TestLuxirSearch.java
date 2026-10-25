@@ -50,6 +50,9 @@ import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.FuzzyQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.PhraseQuery;
+import org.apache.lucene.queries.spans.SpanNearQuery;
+import org.apache.lucene.queries.spans.SpanQuery;
+import org.apache.lucene.queries.spans.SpanTermQuery;
 import org.apache.lucene.search.PrefixQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.RegexpQuery;
@@ -571,6 +574,8 @@ public class TestLuxirSearch extends LuceneTestCase {
 
     // one-call top-k + exact count + match set (null: shape not supported natively)
     LuxirSearch.Result res = LuxirSearch.topK(ls, q, 10, null, true);
+    if (q instanceof PhraseQuery pq && pq.getSlop() > 0) assertNotNull(info + ": sloppy phrases run natively", res);
+    if (q instanceof SpanNearQuery sn && distinctTerms(sn)) assertNotNull(info + ": ordered spans run natively", res);
     if (res == null) return false;
     assertEquals(info, expected.totalHits.value(), res.totalHits());
     ScoreDoc[] got = new ScoreDoc[res.docs().length];
@@ -595,6 +600,14 @@ public class TestLuxirSearch extends LuceneTestCase {
     return true;
   }
 
+  private static boolean distinctTerms(SpanNearQuery q) {
+    java.util.Set<Term> seen = new java.util.HashSet<>();
+    for (SpanQuery c : q.getClauses()) {
+      if (!seen.add(((SpanTermQuery) c).getTerm())) return false;
+    }
+    return true;
+  }
+
   private static ScoreDoc[] toScoreDocs(LuxirSearch.Result r) {
     ScoreDoc[] out = new ScoreDoc[r.docs().length];
     for (int i = 0; i < out.length; i++) out[i] = new ScoreDoc(r.docs()[i], r.scores()[i]);
@@ -610,6 +623,26 @@ public class TestLuxirSearch extends LuceneTestCase {
       // A different doc at a rank is a near-tie (its score already matched within float noise:
       // boolean sums may differ by an ulp, which can reorder docs whose scores almost tie).
     }
+  }
+
+  /** An ordered span near of 2-3 terms (Solr's {!complexphrase inOrder=true}), some perhaps repeated. */
+  private static Query orderedNear(Random r) {
+    int n = 2 + r.nextInt(2);
+    SpanQuery[] clauses = new SpanQuery[n];
+    for (int i = 0; i < n; i++) clauses[i] = new SpanTermQuery(new Term("body", word(r)));
+    return new SpanNearQuery(clauses, r.nextInt(13), true);
+  }
+
+  /** A sloppy phrase of 2-4 terms, some perhaps repeated, at perhaps gapped positions. */
+  private static Query sloppyPhrase(Random r) {
+    PhraseQuery.Builder b = new PhraseQuery.Builder().setSlop(r.nextInt(12));
+    String[] pool = {word(r), word(r), word(r)};
+    int pos = 0;
+    for (int i = 2 + r.nextInt(3); i > 0; i--) {
+      b.add(new Term("body", r.nextInt(3) == 0 ? pool[r.nextInt(pool.length)] : word(r)), pos);
+      pos += r.nextInt(5) == 0 ? 2 : 1;
+    }
+    return b.build();
   }
 
   private Query randomQuery(Random r) {
@@ -661,7 +694,14 @@ public class TestLuxirSearch extends LuceneTestCase {
       case 3:
         return new PhraseQuery("body", word(r), word(r));
       case 4:
-        return new PhraseQuery(r.nextInt(3), "body", word(r), word(r));
+        switch (r.nextInt(3)) {
+          case 0:
+            return new PhraseQuery(r.nextInt(3), "body", word(r), word(r));
+          case 1:
+            return sloppyPhrase(r);
+          default:
+            return orderedNear(r);
+        }
       case 5:
         return new BoostQuery(new TermQuery(new Term("body", word(r))), 0.5f + 3 * r.nextFloat());
       default: {

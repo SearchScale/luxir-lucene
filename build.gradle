@@ -23,6 +23,9 @@ def nativeLib = findProperty('luxir.lucene.library')
 
 dependencies {
   api "org.apache.lucene:lucene-core:${luceneVersion}"
+  // spans (SpanNearQuery), recognized when present: Solr ships them
+  compileOnly "org.apache.lucene:lucene-queries:${luceneVersion}"
+  testImplementation "org.apache.lucene:lucene-queries:${luceneVersion}"
   testImplementation "org.apache.lucene:lucene-test-framework:${luceneVersion}"
   testImplementation "org.apache.lucene:lucene-analysis-common:${luceneVersion}"
   testImplementation 'junit:junit:4.13.2'
