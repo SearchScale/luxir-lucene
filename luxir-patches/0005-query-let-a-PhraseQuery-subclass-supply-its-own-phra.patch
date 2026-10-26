@@ -1,0 +1,139 @@
+From e96a72dffc8bead79a676da0f213c0cbe9a33962 Mon Sep 17 00:00:00 2001
+From: Ishan Chattopadhyaya <ishan@searchscale.com>
+Date: Tue, 27 Oct 2026 01:27:07 +0530
+Subject: [PATCH 5/5] query: let a PhraseQuery subclass supply its own phrase
+ scorer
+
+PhraseQuery is no longer final. Its Weight assembles one segment's postings,
+positions, norms and impacts as before, then asks the query for the scorer
+through a virtual makeScorer, whose default is the exact or sloppy phrase
+scorer. A subclass that matches the terms' positions its own way (Lucene's
+ordered span-near, for one) returns a PhraseScorer with its own matcher
+policy over the same parts, and keeps the planning, impacts and bounds the
+phrase scorer has. exactMatcher() replaces the slop == 0 check on the route
+that runs the exact phrase scorer directly, and equalsSameKind compares the
+dynamic type, so a subclass never shares a plain phrase's cache entries.
+---
+ src/luxir/query/BooleanWeight.h |  2 +-
+ src/luxir/query/PhraseQuery.h   | 54 +++++++++++++++++++++++++--------
+ 2 files changed, 43 insertions(+), 13 deletions(-)
+
+diff --git a/src/luxir/query/BooleanWeight.h b/src/luxir/query/BooleanWeight.h
+index 2a312ca2..12f523d6 100644
+--- a/src/luxir/query/BooleanWeight.h
++++ b/src/luxir/query/BooleanWeight.h
+@@ -7672,7 +7672,7 @@ class BooleanQuery::Weight final : public Query::Weight {
+       return true;
+     }
+     return query->getKind() == QueryKind::PHRASE
+-        && static_cast<PhraseQuery*>(query)->getSlop() == 0;
++        && static_cast<PhraseQuery*>(query)->exactMatcher();
+   }
+ 
+   static bool lessMaxScore(float a, float b) {
+diff --git a/src/luxir/query/PhraseQuery.h b/src/luxir/query/PhraseQuery.h
+index 35a9c31e..000330c3 100644
+--- a/src/luxir/query/PhraseQuery.h
++++ b/src/luxir/query/PhraseQuery.h
+@@ -10,6 +10,7 @@
+ #include <limits>
+ #include <optional>
+ #include <type_traits>
++#include <typeinfo>
+ #include <vector>
+ 
+ #include "ImpactsIndex.h"
+@@ -19,7 +20,7 @@
+ 
+ namespace luxir {
+ 
+-class PhraseQuery final : public Query {
++class PhraseQuery : public Query {
+   std::string_view field;
+   std::span<std::string_view> terms;
+   std::span<const int32_t> positions;
+@@ -307,9 +308,11 @@ public:
+     assert(slop >= 0);
+   }
+ 
++  // A subclass with a matcher of its own matches different documents: it is never equal to a
++  // plain PhraseQuery over the same terms.
+   bool equalsSameKind(const Query& other) const override {
+     const auto& rhs = static_cast<const PhraseQuery&>(other);
+-    return field == rhs.field && slop == rhs.slop
++    return typeid(*this) == typeid(other) && field == rhs.field && slop == rhs.slop
+         && terms.size() == rhs.terms.size()
+         && positions.size() == rhs.positions.size()
+         && std::equal(terms.begin(), terms.end(), rhs.terms.begin())
+@@ -336,6 +339,21 @@ public:
+   [[nodiscard]] std::span<std::string_view> getTerms() const { return terms; }
+   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }
+   [[nodiscard]] int32_t getSlop() const { return slop; }
++  // Whether this query matches as the exact phrase scorer does, so routes that run that scorer
++  // directly may take it. A subclass with a matcher of its own returns false.
++  [[nodiscard]] virtual bool exactMatcher() const { return slop == 0; }
++
++  // Builds one segment's scorer over the postings, norms and impacts Weight assembled for it. The
++  // default is the exact or the sloppy phrase scorer; a subclass that matches the terms' positions
++  // its own way returns a PhraseScorer with its own matcher policy over the same parts.
++  virtual Query::Scorer* makeScorer(
++      MemPool& targetPool, std::span<DocsPosEnum*> slotEnums, std::span<PosEnum*> slotPosEnums,
++      std::span<const int32_t> positions, std::span<const int32_t> ordinals,
++      std::span<DocsPosEnum*> conjunctionEnums, std::span<PosEnum*> conjunctionPosEnums,
++      NormsReader* normsReader, Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
++      std::span<const int32_t> impactMultiplicities, std::span<const int32_t> slotGroup,
++      std::span<RepeatGroup> groups, int64_t approximationCost, float matchCostEstimate,
++      bool exclusionWindowFill) const;
+ 
+   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                  const FilterKeyContext& ctx) const override {
+@@ -558,19 +576,11 @@ public:
+         if (allBuilt) impacts = built;
+       }
+ 
+-      if (query.getSlop() > 0) {
+-        return targetPool.make<SloppyScorer>(
+-            targetPool, slotEnums, slotPosEnums, positions, ordinals,
+-            conjunctionEnums, conjunctionPosEnums, normsReader,
+-            simScorer, impacts, impactMultiplicities, slotGroup, groups,
+-            estimate.approximationCost, estimate.matchCost, query.getSlop(),
+-            (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
+-      }
+-      return targetPool.make<Scorer>(
++      return query.makeScorer(
+           targetPool, slotEnums, slotPosEnums, positions, ordinals,
+           conjunctionEnums, conjunctionPosEnums, normsReader,
+           simScorer, impacts, impactMultiplicities, slotGroup, groups,
+-          estimate.approximationCost, estimate.matchCost, 0,
++          estimate.approximationCost, estimate.matchCost,
+           (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
+     }
+ 
+@@ -1634,4 +1644,24 @@ public:
+   };
+ };
+ 
++inline Query::Scorer* PhraseQuery::makeScorer(
++    MemPool& targetPool, std::span<DocsPosEnum*> slotEnums, std::span<PosEnum*> slotPosEnums,
++    std::span<const int32_t> positions, std::span<const int32_t> ordinals,
++    std::span<DocsPosEnum*> conjunctionEnums, std::span<PosEnum*> conjunctionPosEnums,
++    NormsReader* normsReader, Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
++    std::span<const int32_t> impactMultiplicities, std::span<const int32_t> slotGroup,
++    std::span<RepeatGroup> groups, int64_t approximationCost, float matchCostEstimate,
++    bool exclusionWindowFill) const {
++  if (slop > 0) {
++    return targetPool.make<SloppyScorer>(
++        targetPool, slotEnums, slotPosEnums, positions, ordinals, conjunctionEnums,
++        conjunctionPosEnums, normsReader, simScorer, impacts, impactMultiplicities, slotGroup,
++        groups, approximationCost, matchCostEstimate, slop, exclusionWindowFill);
++  }
++  return targetPool.make<Scorer>(
++      targetPool, slotEnums, slotPosEnums, positions, ordinals, conjunctionEnums,
++      conjunctionPosEnums, normsReader, simScorer, impacts, impactMultiplicities, slotGroup, groups,
++      approximationCost, matchCostEstimate, 0, exclusionWindowFill);
++}
++
+ } // namespace luxir
+-- 
+2.34.1
+

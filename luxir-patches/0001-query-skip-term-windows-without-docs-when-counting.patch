@@ -1,7 +1,7 @@
-From 61464a8d0ef6ffde88a0e81269aa47c3cdc4567a Mon Sep 17 00:00:00 2001
+From 1622006e90651e7f2f87400725c4f248cfccf469 Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@apache.org>
 Date: Tue, 20 Oct 2026 19:36:48 +0530
-Subject: [PATCH 2/7] query: skip term windows without docs when counting
+Subject: [PATCH 1/5] query: skip term windows without docs when counting
 
 Without a window filter, TermBulkScorer's count and match windows now
 start at the window holding the term's next doc instead of stepping

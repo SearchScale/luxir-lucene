@@ -1,7 +1,7 @@
-From 93a50f1f758361d04abbdfd14507e7220b4f5396 Mon Sep 17 00:00:00 2001
+From 57ab1e21be64d66dd08b0ea65adf54aacf2420d6 Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@searchscale.com>
 Date: Sun, 25 Oct 2026 02:55:08 +0530
-Subject: [PATCH 5/7] index: scan and clear only the norms a term's impact
+Subject: [PATCH 4/5] index: scan and clear only the norms a term's impact
  surfaces use
 
 Every term zeroed four 256-slot (norm -> maxTf) surfaces and the L1 block arrays at start, and its

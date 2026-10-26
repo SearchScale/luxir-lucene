@@ -815,13 +815,71 @@ static int16_t* denseTable(MemPool& pool, const automaton::ByteDfaRange* ranges,
   return table;
 }
 
+// Restricts a DFA, entered at `state` after `prefix`, to the terms that sort strictly after `start`:
+// the product with a comparison of the bytes read so far against start, which is still equal to its
+// first k bytes or already greater. A byte below start's next one leaves no term after it, so its
+// range is dropped; the start term itself and its prefixes are not accepted. Lucene's
+// FuzzyTermsEnum resumes its intersection after a start term whenever its competitive bound
+// tightens. Rewrites the DFA in place and returns the product state after prefix.
+static int32_t restrictAfter(std::vector<automaton::ByteDfaRange>& ranges, std::vector<uint32_t>& offsets,
+                             std::vector<uint8_t>& accepts, int32_t state, std::string_view prefix,
+                             std::string_view start) {
+  const int32_t GREATER = (int32_t)start.size() + 1;
+  int32_t k = 0;  // how much of start prefix matches, or GREATER once prefix sorts after it
+  size_t common = std::min(prefix.size(), start.size());
+  while ((size_t)k < common && prefix[(size_t)k] == start[(size_t)k]) k++;
+  if ((size_t)k < common) {
+    if ((uint8_t)prefix[(size_t)k] < (uint8_t)start[(size_t)k]) {  // every term after prefix sorts before start
+      accepts.assign(1, 0);
+      offsets.assign(2, 0);
+      ranges.clear();
+      return 0;
+    }
+    k = GREATER;
+  } else if (prefix.size() > start.size()) {
+    k = GREATER;
+  }
+  std::vector<automaton::ByteDfaRange> outRanges;
+  std::vector<uint32_t> outOffsets{0};
+  std::vector<uint8_t> outAccepts;
+  boost::unordered_flat_map<int64_t, int32_t> ids;
+  std::vector<std::pair<int32_t, int32_t>> pending;  // (dfa state, k) by product state
+  auto id = [&](int32_t q, int32_t kk) {
+    auto [it, added] = ids.try_emplace((int64_t)q * (GREATER + 1) + kk, (int32_t)pending.size());
+    if (added) pending.emplace_back(q, kk);
+    return it->second;
+  };
+  int32_t initial = id(state, k);
+  for (size_t p = 0; p < pending.size(); p++) {
+    auto [q, kk] = pending[p];
+    outAccepts.push_back(kk == GREATER && accepts[(size_t)q] != 0);
+    // start's next byte; none once the term is greater, or equal to all of start (any byte then sorts after it)
+    int32_t c = kk < (int32_t)start.size() ? (uint8_t)start[(size_t)kk] : -1;
+    for (uint32_t r = offsets[(size_t)q]; r < offsets[(size_t)q + 1]; r++) {
+      auto [lo, hi, dest] = ranges[r];
+      if (c < 0) {
+        outRanges.push_back({lo, hi, id(dest, GREATER)});
+        continue;
+      }
+      if (hi < c) continue;
+      if (lo <= c) outRanges.push_back({(uint8_t)c, (uint8_t)c, id(dest, kk + 1)});
+      if (hi > c) outRanges.push_back({(uint8_t)std::max<int32_t>(lo, c + 1), hi, id(dest, GREATER)});
+    }
+    outOffsets.push_back((uint32_t)outRanges.size());
+  }
+  ranges = std::move(outRanges);
+  offsets = std::move(outOffsets);
+  accepts = std::move(outAccepts);
+  return initial;
+}
+
 struct lxl_intersect {
   std::unique_ptr<lxl_terms> terms;
   MemPool tablePool;
   std::vector<automaton::ByteDfaRange> ranges;
   std::vector<uint32_t> offsets;
   std::vector<uint8_t> accepts;
-  std::string prefix, suffix, startAfter;
+  std::string prefix, suffix;
   std::unique_ptr<DfaIntersectEnum> it;
 };
 
@@ -854,14 +912,15 @@ lxl_intersect* lxl_intersect_new(lxl_reader* r, const char* field, int32_t field
     }
     x->prefix.assign((const char*)prefix, (size_t)prefix_len);
     x->suffix.assign((const char*)suffix, (size_t)suffix_len);
+    if (start_after_len >= 0) {
+      std::string_view start((const char*)start_after, (size_t)start_after_len);
+      initial_state = restrictAfter(x->ranges, x->offsets, x->accepts, initial_state, x->prefix, start);
+      num_states = (int32_t)x->accepts.size();
+    }
     automaton::ByteDfaView view(x->ranges.data(), x->offsets.data(), x->accepts.data(),
                                 denseTable(x->tablePool, x->ranges.data(), x->offsets.data(), (uint32_t)num_states),
                                 (uint32_t)num_states);
     DfaScanPlan plan{x->prefix, x->suffix, initial_state};
-    if (start_after_len >= 0) {
-      x->startAfter.assign((const char*)start_after, (size_t)start_after_len);
-      plan.startAfter = x->startAfter;
-    }
     x->terms = std::move(terms);
     x->it = std::make_unique<DfaIntersectEnum>(x->terms->pool, *x->terms->te, view, plan);
     return x.release();
@@ -977,6 +1036,158 @@ struct SlotTable {
     size_t i = (size_t)slot * numSegs + (size_t)seg;
     if (slot < 0 || (size_t)seg >= numSegs || i >= sets.size() || !sets[i]) return nullptr;
     return &*sets[i];
+  }
+};
+
+// Lucene's ordered SpanNearQuery over single distinct terms (node 12), as its SpanScorer counts
+// NearSpansOrdered: each position of the first term starts at most one match; every later term
+// only moves forward, to its first position at or after the previous term's end; a match counts
+// when the gaps between the terms add up to at most slop, and adds 1 / (1 + gaps) to the
+// frequency. A term running out of positions ends the document's matches. Luxir's phrase scorer
+// runs it with this matcher policy, so planning, impacts and score bounds are the phrase's.
+class OrderedMatcher {
+  int32_t slop;
+  std::span<int32_t> order;    // slots, in query term order
+  std::span<int32_t> current;  // by query term order: current position, -1 before the first
+  int64_t gaps = 0;
+  float freq = 0.0f;
+  bool positioned = false;
+  bool freqComplete = true;
+
+  template <class S>
+  int32_t nextPosition(S& scorer, size_t term) {
+    int32_t position = scorer.slotPosEnums[(size_t)order[term]]->nextPosition();
+    current[term] = position;
+    return position;
+  }
+
+  template <class S>
+  bool nextMatch(S& scorer) {
+    if (!positioned) return false;
+    while (nextPosition(scorer, 0) != PostingsReader::END) {
+      int64_t previousEnd = (int64_t)current[0] + 1;
+      int64_t total = 0;
+      for (size_t term = 1; term < order.size(); term++) {
+        int32_t position = current[term];
+        while ((int64_t)position < previousEnd) position = nextPosition(scorer, term);
+        if (position == PostingsReader::END) {
+          positioned = false;
+          return false;
+        }
+        total += (int64_t)position - previousEnd;
+        previousEnd = (int64_t)position + 1;
+      }
+      if (total <= (int64_t)slop) {
+        gaps = total;
+        return true;
+      }
+    }
+    positioned = false;
+    return false;
+  }
+
+  float matchWeight() const { return 1.0f / (float)(int64_t(1) + gaps); }
+
+ public:
+  static constexpr bool IS_SLOPPY = true;
+
+  explicit OrderedMatcher(int32_t slop) : slop(slop) {}
+
+  template <class S>
+  void init(S& scorer) {
+    assert(scorer.groups.empty());
+    order = scorer.pool->template make_span<int32_t>(scorer.slotEnums.size());
+    current = scorer.pool->template make_span<int32_t>(scorer.slotEnums.size());
+    for (size_t slot = 0; slot < order.size(); slot++) order[(size_t)scorer.ordinals[slot]] = (int32_t)slot;
+  }
+
+  template <class S>
+  bool matches(S& scorer) {
+    freq = 0.0f;
+    freqComplete = true;
+    positioned = false;
+    if (scorer.docid == PostingsReader::END) return false;
+    if (scorer.minCompetitiveScore > 0.0f && scorer.simScorer != nullptr
+        && !PhraseQuery::ScorerControls::disableDocBoundForTests) {
+      // At most one match per position of the first term, each weighing at most 1.
+      int64_t maxFreq = scorer.slotEnums[(size_t)order[0]]->termFreq();
+      float boundFreq = S::roundUpToFloat(maxFreq);
+      if (scorer.simScorer->score(boundFreq, scorer.lookupNorm(scorer.docid)) < scorer.minCompetitiveScore) {
+        skipCount(SkipStats::phraseBoundRejects);
+        return false;
+      }
+    }
+    skipCount(SkipStats::phraseVerifies);
+    for (auto* posEnum : scorer.conjunctionPosEnums) posEnum->startPositions();
+    std::fill(current.begin(), current.end(), -1);
+    positioned = true;
+    if (!nextMatch(scorer)) return false;
+    freq = matchWeight();
+    freqComplete = false;
+    return true;
+  }
+
+  template <class S>
+  float scoreFreq(S& scorer) {
+    if (!freqComplete) {
+      while (nextMatch(scorer)) freq += matchWeight();
+      freqComplete = true;
+    }
+    return freq;
+  }
+
+  template <class S>
+  float getMaxScore(S& scorer, int32_t upTo) {
+    if (scorer.simScorer == nullptr) return 0.0f;
+    float tier1 = scorer.simScorer->internalWeight();
+    if (scorer.impacts.empty() || PhraseQuery::ScorerControls::disableRawBoundsForTests) return tier1;
+    int32_t startDoc = scorer.shallowTarget >= 0 ? scorer.shallowTarget : scorer.docid;
+    // The sloppy bound (1 + the sum of each term's tf - 1) is at least the first term's tf, which
+    // bounds this frequency.
+    int64_t freqBound = 1;
+    int32_t normLower = 0;
+    for (size_t i = 0; i < scorer.impacts.size(); i++) {
+      const ImpactsIndex& termImpacts = scorer.impacts[i];
+      int32_t startBlock = termImpacts.blockContaining(startDoc);
+      if (startBlock >= termImpacts.blockCount()) return tier1;
+      int32_t upBlock = termImpacts.blockContaining(upTo);
+      if (upBlock >= termImpacts.blockCount()) upBlock = termImpacts.blockCount() - 1;
+      if (upBlock < startBlock) return tier1;
+      ImpactsIndex::RawRange raw = termImpacts.rawRangeInRange(startBlock, upBlock);
+      if (raw.maxTf <= 0 || raw.minNorm == std::numeric_limits<int32_t>::max()) return tier1;
+      freqBound += (int64_t)scorer.impactMultiplicities[i] * ((int64_t)raw.maxTf - 1);
+      normLower = std::max(normLower, raw.minNorm);
+    }
+    return scorer.simScorer->score(S::roundUpToFloat(freqBound), normLower);
+  }
+};
+
+class OrderedPhraseQuery final : public PhraseQuery {
+ public:
+  using PhraseQuery::PhraseQuery;
+
+  bool exactMatcher() const override { return false; }
+
+  uint64_t hashImpl() const override { return mixHash(PhraseQuery::hashImpl(), std::string_view("ordered")); }
+
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext& ctx) const override {
+    FilterKeyScope scope = PhraseQuery::appendFilterKey(out, ctx);
+    out.appendByte(1);  // ordered: not the phrase over the same terms
+    return scope;
+  }
+
+  Query::Scorer* makeScorer(MemPool& targetPool, std::span<DocsPosEnum*> slotEnums,
+                            std::span<PosEnum*> slotPosEnums, std::span<const int32_t> positions,
+                            std::span<const int32_t> ordinals, std::span<DocsPosEnum*> conjunctionEnums,
+                            std::span<PosEnum*> conjunctionPosEnums, NormsReader* normsReader,
+                            Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
+                            std::span<const int32_t> impactMultiplicities, std::span<const int32_t> slotGroup,
+                            std::span<RepeatGroup> groups, int64_t approximationCost, float matchCostEstimate,
+                            bool exclusionWindowFill) const override {
+    return targetPool.make<PhraseScorer<OrderedMatcher>>(
+        targetPool, slotEnums, slotPosEnums, positions, ordinals, conjunctionEnums, conjunctionPosEnums,
+        normsReader, simScorer, impacts, impactMultiplicities, slotGroup, groups, approximationCost,
+        matchCostEstimate, getSlop(), exclusionWindowFill);
   }
 };
 
@@ -1423,8 +1634,8 @@ struct QueryParser {
           s.totalTermFreq = get<int64_t>();
           terms.push_back({field, words[i], s});
         }
-        return pool.make<PhraseQuery>(field, std::span<std::string_view>(words, (size_t)n),
-                                      std::span<const int32_t>(positions, (size_t)n), slop, true);
+        return pool.make<OrderedPhraseQuery>(field, std::span<std::string_view>(words, (size_t)n),
+                                             std::span<const int32_t>(positions, (size_t)n), slop);
       }
       case 13: {  // constant-score byte DFA (a wildcard/regexp), walked over each segment's terms
         std::string_view field = this->field();
