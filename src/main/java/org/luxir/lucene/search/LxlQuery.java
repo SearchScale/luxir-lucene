@@ -15,6 +15,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.TermStates;
 import org.apache.lucene.search.AutomatonQuery;
@@ -395,11 +396,11 @@ public final class LxlQuery {
     }
     if (q instanceof MatchAllDocsQuery) {
       fieldless = true;
-      if (scores) {
-        // Lucene scores every doc 1; Luxir's match-all contributes 0 to a scored sum
-        body.write(5);
-        f32(1f);
-      }
+      // Lucene scores every doc 1; Luxir's match-all contributes 0 to a scored sum. Unscored too:
+      // Luxir's planner takes a bare match-all for its own required non-scoring seed, which as an
+      // optional clause of a nested boolean changed what the enclosing boolean matched.
+      body.write(5);
+      f32(1f);
       body.write(7);
       return true;
     }
@@ -597,7 +598,45 @@ public final class LxlQuery {
       i64(-1);
       return;
     }
-    termStats(t, scores ? TermStates.build(searcher, t, true) : null);
+    if (!scores) {
+      i64(0);
+      i64(0);
+      return;
+    }
+    long[] summed = nativeTermStats(t);
+    if (summed != null) {
+      long df = 0, ttf = 0;
+      if (summed[0] > 0) {
+        TermStatistics ts = searcher.termStatistics(t, (int) summed[0], summed[1]);
+        if (ts != null) {
+          df = ts.docFreq();
+          ttf = ts.totalTermFreq();
+        }
+      }
+      i64(df);
+      i64(ttf);
+      return;
+    }
+    termStats(t, TermStates.build(searcher, t, true));
+  }
+
+  /**
+   * The term's index-wide docFreq and totalTermFreq summed from one native lookup per segment (as
+   * TermStates.build sums them, without a terms enum per segment); null if a segment's terms are
+   * not native (or the term is too long for them).
+   */
+  private long[] nativeTermStats(Term t) throws IOException {
+    long df = 0, ttf = 0;
+    for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
+      org.apache.lucene.index.Terms terms = NativeLeaf.unwrap(ctx.reader()).terms(t.field());
+      if (terms == null) continue;
+      if (!(terms instanceof org.luxir.lucene.codec.LuxirTerms lt)) return null;
+      long[] st = lt.termStats(t.bytes());
+      if (st == null) return null;
+      df += st[0];
+      ttf += st[1];
+    }
+    return new long[] {df, ttf};
   }
 
   private void termStats(Term t, TermStates states) throws IOException {

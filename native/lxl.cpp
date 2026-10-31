@@ -756,6 +756,20 @@ lxl_terms* lxl_terms_new(lxl_reader* r, const char* field, int32_t field_len) {
 
 void lxl_terms_free(lxl_terms* t) { delete t; }
 
+int32_t lxl_term_stats(lxl_reader* r, const char* field, int32_t field_len, const uint8_t* term, int32_t term_len,
+                       int64_t* stats) {
+  return guarded([&]() -> int32_t {
+    auto found = findField(*r->postings, std::string_view(field, (size_t)field_len));
+    if (!found) return 0;
+    MemPool pool;
+    TermsEnum te(pool, *r->postings, *found);
+    if (!te.seek(std::string_view((const char*)term, (size_t)term_len))) return 0;
+    stats[0] = te.docFreq();
+    stats[1] = te.totalTermFreq();
+    return 1;
+  });
+}
+
 int32_t lxl_terms_next(lxl_terms* t, uint8_t* term_out, int64_t* stats) {
   return guarded([&] {
     if (t->exhausted || !t->te->nextTerm()) {
@@ -2257,7 +2271,8 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
                         uint64_t* const* match_bits, int32_t num_slots,
                         const uint64_t* const* slot_bits, const int32_t* slot_counts, int32_t num_cols,
                         lxl_reader* const* col_stores, const char* const* col_names,
-                        lxl_points* const* col_points, const int64_t* col_offsets) {
+                        lxl_points* const* col_points, const int64_t* col_offsets, int32_t* match_docs,
+                        int32_t match_docs_cap, int32_t* seg_match_counts) {
   return guarded([&]() -> int32_t {
     MultiCall call(m, query, query_len, live, num_live, num_slots, slot_bits, slot_counts, num_cols, col_stores,
                    col_names, col_points, col_offsets);
@@ -2268,7 +2283,11 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
 
     int64_t count = -1;
     bool exact = true;
-    if (match_bits != nullptr) count_limit = -1;
+    // listing: the matches as segment-local docs in segment order, up to match_docs_cap
+    bool listing = match_docs != nullptr;
+    int32_t listed = 0;
+    bool overflow = false;
+    if (match_bits != nullptr || listing) count_limit = -1;
     if (count_limit != 0) {
       count = 0;
       auto* w = prepared.weight(0);
@@ -2283,8 +2302,20 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
         if (supplier == nullptr) continue;
         uint64_t* bits = match_bits != nullptr ? match_bits[i] : nullptr;
         DocSet* filter = filterOf(i);
-        auto use = bits != nullptr ? Query::ExecutionUse::MATCH_WINDOWS : Query::ExecutionUse::COUNT_WINDOWS;
-        if (bits == nullptr && filter == nullptr) {
+        bool collect = bits != nullptr || listing;
+        auto add = [&](int32_t d) {
+          if (bits != nullptr) bits[d >> 6] |= 1ULL << (d & 63);
+          if (listing) {
+            if (listed == match_docs_cap) {
+              overflow = true;
+              return;
+            }
+            match_docs[listed++] = d;
+            seg_match_counts[i]++;
+          }
+        };
+        auto use = collect ? Query::ExecutionUse::MATCH_WINDOWS : Query::ExecutionUse::COUNT_WINDOWS;
+        if (!collect && filter == nullptr) {
           int64_t constant = constantCountOf(*w, seg, prepared.pool);
           if (constant >= 0) {
             count += constant;
@@ -2292,7 +2323,7 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
           }
         }
         BulkScorer* bulk = bulkFor(prepared.pool, *supplier, use);
-        if (bulk != nullptr && bits == nullptr) {
+        if (bulk != nullptr && !collect) {
           if (count_limit < 0) {
             count += countMatchesWindowed(bulk, filter, nullptr, seg.maxDoc());
           } else {
@@ -2308,28 +2339,26 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
           while (cursor != PostingsReader::END && cursor < seg.maxDoc()) {
             ScoreWindow window;
             int32_t next = bulk->matchNextWindow(window, filter, cursor, seg.maxDoc());
-            for (int32_t j = 0; j < window.size; j++) {
-              int32_t d = window.docs[(size_t)j];
-              bits[d >> 6] |= 1ULL << (d & 63);
-            }
+            for (int32_t j = 0; j < window.size && !overflow; j++) add(window.docs[(size_t)j]);
             count += window.size;
-            if (next == PostingsReader::END) break;
+            if (overflow || next == PostingsReader::END) break;
             cursor = next;
           }
         } else if (auto* s = pullScorer(prepared.pool, *supplier)) {
           for (int32_t d = s->next(); d != PostingsReader::END; d = s->next()) {
             if (filter != nullptr && !filter->get(d)) continue;
-            if (bits != nullptr) bits[d >> 6] |= 1ULL << (d & 63);
-            if (++count == count_limit) break;
+            if (collect) add(d);
+            if (overflow || ++count == count_limit) break;
           }
         }
+        if (overflow) return LXL_MATCHES_OVERFLOW;  // the caller asks again for bits
       }
     }
 
     int32_t got = 0;
     int64_t ranked = 0;
     bool rankedFromBits = false;
-    if (k > 0 && count > 0 && match_bits != nullptr) {
+    if (k > 0 && count > 0 && (match_bits != nullptr || listing)) {
       // A constant-score query's top k are its first k matches by (segment, doc), the order
       // TopDocsCollector breaks score ties in: read them from the counting pass's bits instead
       // of running the query again. One scorer, planned for a single doc, supplies the score.
@@ -2337,26 +2366,34 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
       if (w->isConstantScoring()) {
         float score = 0;
         bool scored = false;
-        for (size_t i = 0; i < n && got < k; i++) {
-          if (match_bits[i] == nullptr) continue;
-          Segment& seg = segments[i];
-          size_t words = ((size_t)seg.maxDoc() + 63) / 64;
-          for (size_t wi = 0; wi < words && got < k; wi++) {
-            for (uint64_t word = match_bits[i][wi]; word != 0 && got < k; word &= word - 1) {
-              int32_t d = (int32_t)(wi * 64 + (size_t)std::countr_zero(word));
-              if (!scored) {
-                auto* supplier = w->scorerSupplier(prepared.pool, seg);
-                auto* s = supplier == nullptr ? nullptr
-                    : supplier->resolve(prepared.pool, supplier->makePlanContext(Query::Demand::fromLeadCost(1)))
-                          ->build(prepared.pool);
-                if (s == nullptr || s->advance(d) != d) throw std::logic_error("lxl: counted match not found");
-                score = s->score();
-                scored = true;
+        auto take = [&](size_t i, int32_t d) {
+          if (!scored) {
+            Segment& seg = segments[i];
+            auto* supplier = w->scorerSupplier(prepared.pool, seg);
+            auto* s = supplier == nullptr ? nullptr
+                : supplier->resolve(prepared.pool, supplier->makePlanContext(Query::Demand::fromLeadCost(1)))
+                      ->build(prepared.pool);
+            if (s == nullptr || s->advance(d) != d) throw std::logic_error("lxl: counted match not found");
+            score = s->score();
+            scored = true;
+          }
+          segs[got] = (int32_t)i;
+          docs[got] = d;
+          scores[got] = score;
+          got++;
+        };
+        if (listing) {
+          for (size_t i = 0, at = 0; i < n && got < k; at += (size_t)seg_match_counts[i], i++) {
+            for (int32_t j = 0; j < seg_match_counts[i] && got < k; j++) take(i, match_docs[at + (size_t)j]);
+          }
+        } else {
+          for (size_t i = 0; i < n && got < k; i++) {
+            if (match_bits[i] == nullptr) continue;
+            size_t words = ((size_t)segments[i].maxDoc() + 63) / 64;
+            for (size_t wi = 0; wi < words && got < k; wi++) {
+              for (uint64_t word = match_bits[i][wi]; word != 0 && got < k; word &= word - 1) {
+                take(i, (int32_t)(wi * 64 + (size_t)std::countr_zero(word)));
               }
-              segs[got] = (int32_t)i;
-              docs[got] = d;
-              scores[got] = score;
-              got++;
             }
           }
         }
@@ -3826,7 +3863,8 @@ int32_t popcount(const uint64_t* bits, int32_t max_doc) {
 extern "C" {
 
 int32_t lxl_column_ord_counts_sparse(lxl_reader* r, const char* name, int32_t name_len, const uint64_t* matches,
-                                     int32_t num_matches, int32_t max_doc, int64_t n_ords, int32_t* ords,
+                                     const int32_t* match_docs, int32_t num_matches, int32_t max_doc,
+                                     int64_t n_ords, int32_t* ords,
                                      int32_t* counts, int32_t cap, int32_t* missing) {
   return guarded([&]() -> int32_t {
     *missing = 0;
@@ -3839,7 +3877,7 @@ int32_t lxl_column_ord_counts_sparse(lxl_reader* r, const char* name, int32_t na
     if ((int64_t)dense.size() < n_ords) dense.resize((size_t)n_ords, 0);
     touched.clear();
     try {
-      scanColumn(r, name, name_len, matches, num_matches, max_doc, [&](int32_t, std::span<const int64_t> v) {
+      scanColumn(r, name, name_len, matches, match_docs, num_matches, max_doc, [&](int32_t, std::span<const int64_t> v) {
         if (v.empty()) {
           (*missing)++;
           return;

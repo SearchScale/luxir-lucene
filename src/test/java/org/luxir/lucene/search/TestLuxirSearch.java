@@ -803,6 +803,24 @@ public class TestLuxirSearch extends LuceneTestCase {
     for (ScoreDoc sd : all.scoreDocs) want.set(sd.doc);
     assertEquals(info, want, res.matches());
     assertTrue(info, res.exactCount());
+    // matches wanted sparse: listed natively when few, else bits (and then as Lucene's)
+    LuxirSearch.Result listed = LuxirSearch.topK(ls, q, List.of(), 10, Integer.MAX_VALUE, null, false, true, true);
+    assertEquals(info, expected.totalHits.value(), listed.totalHits());
+    assertSameHits(info + " (listed)", expected.scoreDocs, toScoreDocs(listed));
+    if (listed.matchDocs() != null) {
+      assertArrayEquals(info, docs(want), listed.matchDocs());
+    } else {
+      assertEquals(info, want, listed.matches());
+    }
+    // matches wanted sparse: listed natively when few, else bits (and then as Lucene's)
+    LuxirSearch.Result sparse = LuxirSearch.topK(ls, q, List.of(), 10, Integer.MAX_VALUE, null, false, true, true);
+    assertEquals(info, expected.totalHits.value(), sparse.totalHits());
+    assertSameHits(info + " (sparse)", expected.scoreDocs, toScoreDocs(sparse));
+    if (sparse.matchDocs() != null) {
+      assertArrayEquals(info, docs(want), sparse.matchDocs());
+    } else {
+      assertEquals(info, want, sparse.matches());
+    }
 
     // minExactCount: exact below the threshold, a lower bound of at least the threshold above it
     int threshold = 1 + random().nextInt(50);

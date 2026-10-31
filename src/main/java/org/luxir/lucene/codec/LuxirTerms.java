@@ -12,6 +12,7 @@ import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.CompiledAutomaton;
+import org.luxir.lucene.LxlNative;
 
 /**
  * A field stored in Luxir format.
@@ -76,6 +77,27 @@ public final class LuxirTerms extends Terms implements Supplier<MemorySegment>, 
     if (dfa == null) return super.intersect(compiled, startTerm);
     LuxirTermsEnum terms = new LuxirTermsEnum(producer, stats.name(), dfa, docsOnly);
     return overflow.isEmpty() ? terms : new MergedTermsEnum(terms, overflow.new Enum(compiled, startTerm));
+  }
+
+  /**
+   * The term's docFreq and totalTermFreq in this segment by one native lookup (zeros if absent),
+   * without a terms enum; null for a term too long for the native dictionary.
+   */
+  public long[] termStats(BytesRef term) {
+    if (term.length > LxlNative.MAX_TERM) return null;
+    producer.ensureOpen();
+    byte[] fieldBytes = stats.name().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    byte[] bytes = Arrays.copyOfRange(term.bytes, term.offset, term.offset + term.length);
+    long[] out = new long[2];
+    int found;
+    try {
+      found = (int) LxlNative.TERM_STATS.invokeExact(producer.nativeReader(), LxlNative.heap(fieldBytes),
+          fieldBytes.length, LxlNative.heap(bytes), bytes.length, LxlNative.heap(out));
+    } catch (Throwable t) {
+      throw LxlNative.rethrow(t);
+    }
+    LxlNative.check(found);
+    return found == 1 ? out : new long[2];
   }
 
   @Override

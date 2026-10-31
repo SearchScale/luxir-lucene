@@ -50,10 +50,15 @@ public final class LuxirFacets {
    * the touched ordinals only (and the matches without a value); null if not native.
    */
   public static OrdCounts sparseOrdCounts(LeafReaderContext ctx, String field, FixedBitSet matches, int numOrds) {
+    return sparseOrdCounts(ctx, field, DocMatches.of(matches), numOrds);
+  }
+
+  /** As {@link #sparseOrdCounts(LeafReaderContext, String, FixedBitSet, int)}, over a doc list or bits. */
+  public static OrdCounts sparseOrdCounts(LeafReaderContext ctx, String field, DocMatches matches, int numOrds) {
     NativeLeaf.NativeColumn col = NativeLeaf.nativeColumn(ctx.reader(), field);
     if (col == null) return null;
     try (Arena arena = Arena.ofConfined()) {
-      NativeLeaf.Words m = words(ctx, matches, arena);
+      DocMatches.Leaf m = matches.leaf(ctx, arena);
       if (m.count() == 0) return new OrdCounts(new int[0], new int[0], 0);
       if (col == NativeLeaf.NO_COLUMN || col.store().equals(MemorySegment.NULL) || numOrds == 0) {
         return new OrdCounts(new int[0], new int[0], m.count());
@@ -67,7 +72,7 @@ public final class LuxirFacets {
         int n;
         try {
           n = (int) LxlNative.COLUMN_ORD_COUNTS_SPARSE.invokeExact(col.store(), name, col.column().length, m.words(),
-              m.count(), ctx.reader().maxDoc(), (long) numOrds, ords, counts, cap, missing);
+              m.docs(), m.count(), ctx.reader().maxDoc(), (long) numOrds, ords, counts, cap, missing);
         } catch (Throwable t) {
           throw LxlNative.rethrow(t);
         }

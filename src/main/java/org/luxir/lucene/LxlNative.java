@@ -184,8 +184,8 @@ public final class LxlNative {
               JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS));
   public static final MethodHandle COLUMN_ORD_COUNTS_SPARSE =
       fn("lxl_column_ord_counts_sparse",
-          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_LONG, ADDRESS,
-              ADDRESS, JAVA_INT, ADDRESS));
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_LONG,
+              ADDRESS, ADDRESS, JAVA_INT, ADDRESS));
   public static final MethodHandle COLUMN_VALUE_COUNTS =
       fn("lxl_column_value_counts",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT,
@@ -232,6 +232,9 @@ public final class LxlNative {
   public static final MethodHandle TERMS_FREE = fn("lxl_terms_free", FunctionDescriptor.ofVoid(ADDRESS));
   public static final MethodHandle TERMS_NEXT =
       fn("lxl_terms_next", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), CRITICAL);
+  public static final MethodHandle TERM_STATS =
+      fn("lxl_term_stats", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, ADDRESS),
+          CRITICAL);
   public static final MethodHandle TERMS_SEEK =
       fn("lxl_terms_seek",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
@@ -288,7 +291,9 @@ public final class LxlNative {
       fn("lxl_multi_top_k",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, JAVA_LONG, ADDRESS,
               ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS,
-              ADDRESS, ADDRESS));
+              ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS));
+  /** lxl_multi_top_k's return when the listed matches would exceed their buffer. */
+  public static final int MATCHES_OVERFLOW = -2;
   public static final MethodHandle MULTI_TOP_K_SORTED =
       fn("lxl_multi_top_k_sorted",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS,

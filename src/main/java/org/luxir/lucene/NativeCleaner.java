@@ -5,6 +5,8 @@ package org.luxir.lucene;
 
 import java.lang.ref.PhantomReference;
 import java.lang.ref.ReferenceQueue;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -19,7 +21,13 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class NativeCleaner {
   private static final ReferenceQueue<Object> QUEUE = new ReferenceQueue<>();
-  private static final Set<Ref> LIVE = ConcurrentHashMap.newKeySet();
+  // striped by registering thread: searches register many short-lived owners from every thread
+  private static final int STRIPES = 32;
+  private static final List<Set<Ref>> LIVE = new ArrayList<>(STRIPES);
+
+  static {
+    for (int i = 0; i < STRIPES; i++) LIVE.add(ConcurrentHashMap.newKeySet());
+  }
 
   static {
     // in the root thread group, as the JDK's cleaner thread: not one of whichever group (a test's,
@@ -35,16 +43,19 @@ public final class NativeCleaner {
 
   private static final class Ref extends PhantomReference<Object> {
     final Runnable action;
+    final int stripe;
 
-    Ref(Object owner, Runnable action) {
+    Ref(Object owner, Runnable action, int stripe) {
       super(owner, QUEUE);
       this.action = action;
+      this.stripe = stripe;
     }
   }
 
   /** Runs {@code action} once {@code owner} is unreachable; the action must not refer to it. */
   public static void register(Object owner, Runnable action) {
-    LIVE.add(new Ref(owner, action));
+    int stripe = (int) (Thread.currentThread().threadId() & (STRIPES - 1));
+    LIVE.get(stripe).add(new Ref(owner, action, stripe));
   }
 
   private static void drain() {
@@ -55,7 +66,7 @@ public final class NativeCleaner {
       } catch (InterruptedException e) {
         continue; // a daemon: runs as long as the JVM
       }
-      LIVE.remove(r);
+      LIVE.get(r.stripe).remove(r);
       try {
         r.action.run();
       } catch (Throwable t) {

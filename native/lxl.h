@@ -130,6 +130,10 @@ LXL_API void lxl_terms_free(lxl_terms* t);
 /* Moves to the next term; copies it to term_out (>= LXL_MAX_TERM bytes) and
  * fills stats (docFreq, totalTermFreq, ord). Returns its length, -2 at end. */
 LXL_API int32_t lxl_terms_next(lxl_terms* t, uint8_t* term_out, int64_t* stats);
+/* A term's docFreq and totalTermFreq (stats[0], stats[1]) in the field: 1, or 0 if absent. One call,
+ * no enum to keep. */
+LXL_API int32_t lxl_term_stats(lxl_reader* r, const char* field, int32_t field_len, const uint8_t* term,
+                               int32_t term_len, int64_t* stats);
 #define LXL_SEEK_FOUND 0
 #define LXL_SEEK_NOT_FOUND 1
 #define LXL_SEEK_END 2
@@ -241,7 +245,12 @@ LXL_API int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t quer
                                 const uint64_t* const* slot_bits, const int32_t* slot_counts,
                                 int32_t num_cols, lxl_reader* const* col_stores,
                                 const char* const* col_names, lxl_points* const* col_points,
-                                const int64_t* col_offsets);
+                                const int64_t* col_offsets, int32_t* match_docs, int32_t match_docs_cap,
+                                int32_t* seg_match_counts);
+/* With match_docs (and no match_bits) lxl_multi_top_k lists the matches instead: segment-local docs
+ * in segment order, seg_match_counts[i] of them for segment i (zeroed by the caller); more than
+ * match_docs_cap of them returns LXL_MATCHES_OVERFLOW, for the caller to ask for bits instead. */
+#define LXL_MATCHES_OVERFLOW (-2)
 
 /* ---- stored values, numeric columns and points ------------------------------------
  * Written into a plain writer (lxl_writer_new; lxl_writer_set_max_doc before
@@ -367,9 +376,9 @@ LXL_API int32_t lxl_columns_top_k(int32_t n, lxl_reader* const* stores, const ch
  * (ascending) and their counts; returns how many there are, filling the arrays only if that fits
  * in cap. *missing: docs without a value. */
 LXL_API int32_t lxl_column_ord_counts_sparse(lxl_reader* r, const char* name, int32_t name_len,
-                                             const uint64_t* matches, int32_t num_matches, int32_t max_doc,
-                                             int64_t n_ords, int32_t* ords, int32_t* counts, int32_t cap,
-                                             int32_t* missing);
+                                             const uint64_t* matches, const int32_t* match_docs,
+                                             int32_t num_matches, int32_t max_doc, int64_t n_ords, int32_t* ords,
+                                             int32_t* counts, int32_t cap, int32_t* missing);
 /* Values with their doc counts and first doc: *out points to that many
  * {int64 value; int32 count; int32 first_doc} (16 bytes each), the calling thread's until its next
  * call or lxl_value_counts_release. Returns how many there are. *missing: docs without a value.
