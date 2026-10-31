@@ -145,6 +145,19 @@ public final class LxlNative {
   public static final MethodHandle NUMERIC_FILL =
       fn("lxl_numeric_fill",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT), CRITICAL);
+  public static final MethodHandle NUMERIC_GATHER =
+      fn("lxl_numeric_gather", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
+          CRITICAL);
+  public static final MethodHandle NUMERIC_GATHERS = fn("lxl_numeric_gathers", FunctionDescriptor.of(JAVA_LONG));
+
+  /** Doc-value gathers of hinted matches done so far (for tests). */
+  public static long numericGathers() {
+    try {
+      return (long) NUMERIC_GATHERS.invokeExact();
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
   public static final MethodHandle NUMERIC_FILL_ONCE =
       fn("lxl_numeric_fill_once",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT,
@@ -161,6 +174,12 @@ public final class LxlNative {
       fn("lxl_column_top_k",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT,
               JAVA_INT, JAVA_LONG, ADDRESS, ADDRESS));
+  /** Most sort fields {@link #COLUMNS_TOP_K} takes (LXL_MAX_SORT_KEYS). */
+  public static final int MAX_SORT_KEYS = 4;
+  public static final MethodHandle COLUMNS_TOP_K =
+      fn("lxl_columns_top_k",
+          FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
+              JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS));
   public static final MethodHandle COLUMN_ORD_COUNTS_SPARSE =
       fn("lxl_column_ord_counts_sparse",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_LONG, ADDRESS,
@@ -242,6 +261,8 @@ public final class LxlNative {
       fn("lxl_postings_positions", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), CRITICAL);
 
   // query execution
+  public static final MethodHandle EXEC_HINT =
+      fn("lxl_exec_hint", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS));
   public static final MethodHandle EXEC_NEW =
       fn("lxl_exec_new", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, ADDRESS, JAVA_INT));
   public static final MethodHandle EXEC_FREE = fn("lxl_exec_free", FunctionDescriptor.ofVoid(ADDRESS));

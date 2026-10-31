@@ -192,6 +192,9 @@ typedef struct lxl_exec lxl_exec;
 LXL_API lxl_exec* lxl_exec_new(lxl_reader* r, const uint8_t* query, int64_t query_len,
                                int32_t flags, const uint64_t* live, int32_t num_live);
 LXL_API void lxl_exec_free(lxl_exec* e);
+/* Publish each window's matches on the calling thread for the segment's doc values in dv_store
+ * (see lxl_numeric_gather). */
+LXL_API void lxl_exec_hint(lxl_exec* e, lxl_reader* dv_store);
 /* Next window of matches in [min, max) scoring >= min_competitive. Writes up
  * to cap docs/scores, *n the count; returns the resume doc or LXL_END. */
 LXL_API int32_t lxl_exec_window(lxl_exec* e, int32_t min, int32_t max, float min_competitive,
@@ -311,12 +314,20 @@ LXL_API int32_t lxl_stored_doc(lxl_stored* s, int32_t doc, uint8_t* out, int32_t
 /* Numeric column iterator (single thread). */
 LXL_API lxl_numeric* lxl_numeric_new(lxl_reader* r, const char* name, int32_t name_len);
 LXL_API void lxl_numeric_free(lxl_numeric* c);
-/* Up to cap docs >= target that have values (targets increase across calls):
+/* Up to cap docs >= target that have values (targets increase across calls, except after
+ * lxl_numeric_gather, which a fill may resume below):
  * docs[i], and for single-valued columns values[i]; for multi-valued columns
  * counts[i] and the values flattened (at most value_cap). Returns the count, 0
  * at the end. */
 LXL_API int32_t lxl_numeric_fill(lxl_numeric* c, int32_t target, int32_t* docs, int32_t* counts,
                                  int64_t* values, int32_t cap, int32_t value_cap);
+/* The matches the calling thread's last hinted exec window handed out (see lxl_exec_hint) from
+ * target on, at most cap, for a single-valued column of the same segment: docs, present (1 if the
+ * doc has a value) and values. Returns how many; 0 if target is not one of those matches. */
+LXL_API int32_t lxl_numeric_gather(lxl_numeric* c, int32_t target, int32_t cap, int32_t* docs,
+                                   int32_t* present, int64_t* values);
+/* Gathers done (for tests). */
+LXL_API int64_t lxl_numeric_gathers(void);
 /* As lxl_numeric_new, lxl_numeric_fill and lxl_numeric_free in one call: one block of the column's
  * docs >= target, without keeping an iterator. */
 LXL_API int32_t lxl_numeric_fill_once(lxl_reader* r, const char* name, int32_t name_len, int32_t target,
@@ -340,6 +351,14 @@ LXL_API int32_t lxl_points_leaf(lxl_points* p, int32_t leaf, int32_t* docs, int6
 LXL_API int32_t lxl_column_top_k(lxl_reader* r, const char* name, int32_t name_len, int32_t kind,
                                  const uint64_t* matches, int32_t num_matches, int32_t max_doc, int32_t k,
                                  int32_t reverse, int64_t missing_key, int32_t* docs_out, int64_t* keys_out);
+/* As lxl_column_top_k, by the sort keys of n (1 to LXL_MAX_SORT_KEYS) single-valued columns in
+ * turn, then doc: column i is names[i] in stores[i] (NULL name: no values in the segment, every
+ * doc takes missing_keys[i]), with kinds[i] and reverses[i]. Doc j's keys go to keys_out[j * n]. */
+#define LXL_MAX_SORT_KEYS 4
+LXL_API int32_t lxl_columns_top_k(int32_t n, lxl_reader* const* stores, const char* const* names,
+                                  const int32_t* name_lens, const int32_t* kinds, const int32_t* reverses,
+                                  const int64_t* missing_keys, const uint64_t* matches, int32_t num_matches,
+                                  int32_t max_doc, int32_t k, int32_t* docs_out, int64_t* keys_out);
 /* Facet counting over the matching docs (max_doc bits) by a column: the touched ordinals
  * (ascending) and their counts; returns how many there are, filling the arrays only if that fits
  * in cap. *missing: docs without a value. */

@@ -280,6 +280,7 @@ public class TestLuxirSearch extends LuceneTestCase {
         cs.setQueryCache(null);
         int iters = atLeast(200);
         int ran = 0;
+        long gathers = LxlNative.numericGathers();
         for (int it = 0; it < iters; it++) {
           Query q = valueQuery(r, 0);
           List<Query> filters = new ArrayList<>();
@@ -288,9 +289,11 @@ public class TestLuxirSearch extends LuceneTestCase {
           if (checkFiltered(q, filters, ls, cs)) ran++;
           if (filters.isEmpty()) check(q, ls, cs);
           checkSorted(r, q, filters, ls, cs);
+          checkPerHitValues(r, q, ls, cs);
           checkFacets(r, q, filters, ls, cs);
         }
         assertTrue("native path ran for only " + ran + " of " + iters, ran > iters * 0.9);
+        assertTrue("per-match doc values were never gathered", LxlNative.numericGathers() > gathers);
       }
     }
   }
@@ -427,8 +430,78 @@ public class TestLuxirSearch extends LuceneTestCase {
   /** A field sort, natively, must give exactly Lucene's order (ties by doc id). */
   private void checkSorted(Random r, Query q, List<Query> filters, IndexSearcher ls, IndexSearcher cs)
       throws IOException {
+    // one field, or 2-4 distinct fields (kind and year tie often, so later fields decide)
+    List<Integer> picks = new ArrayList<>(List.of(0, 1, 2, 3));
+    java.util.Collections.shuffle(picks, r);
+    int n = r.nextBoolean() ? 1 : 2 + r.nextInt(3);
+    SortField[] fields = new SortField[n];
+    for (int i = 0; i < n; i++) fields[i] = sortField(r, picks.get(i));
+    Sort sort = new Sort(fields);
+    int k = 1 + r.nextInt(20);
+    Query full = LuxirSearch.withFilters(q, filters);
+    String info = full + " sort " + sort;
+    TopDocs expected = cs.search(full, new TopFieldCollectorManager(sort, k, Integer.MAX_VALUE));
+    // without the match set, each segment's top k is kept as matches are found; with it, from its bits
+    boolean wantMatches = r.nextBoolean();
+    LuxirSearch.Result res = n == 1 && r.nextBoolean()
+        ? LuxirSearch.topKSorted(ls, q, filters, fields[0], k, null, wantMatches)
+        : LuxirSearch.topKSorted(ls, q, filters, sort, k, null, false, wantMatches, false);
+    assertNotNull(info + ": " + LuxirSearch.whyNotNative(ls, q, filters), res);
+    assertEquals(info, expected.totalHits.value(), res.totalHits());
+    assertEquals(info, expected.scoreDocs.length, res.docs().length);
+    for (int i = 0; i < res.docs().length; i++) assertEquals(info + " rank " + i, expected.scoreDocs[i].doc, res.docs()[i]);
+  }
+
+  /**
+   * A collector reading doc values per match, as grouping, collapsing and Lucene's comparators do
+   * (Luxir gathers them a window of matches at a time), sometimes skipping fields or stepping with
+   * nextDoc: the values read must be Lucene's.
+   */
+  private void checkPerHitValues(Random r, Query q, IndexSearcher ls, IndexSearcher cs) throws IOException {
+    long seed = r.nextLong();
+    List<String> got = perHitValues(ls, new LuxirAcceleratedQuery(q), new Random(seed));
+    List<String> want = perHitValues(cs, q, new Random(seed));
+    assertEquals(q.toString(), want, got);
+  }
+
+  private static List<String> perHitValues(IndexSearcher s, Query q, Random r) throws IOException {
+    List<String> out = new ArrayList<>();
+    for (LeafReaderContext ctx : s.getIndexReader().leaves()) {
+      org.apache.lucene.search.Weight w = s.createWeight(s.rewrite(q), org.apache.lucene.search.ScoreMode.COMPLETE_NO_SCORES, 1f);
+      org.apache.lucene.search.BulkScorer bs = w.bulkScorer(ctx);
+      if (bs == null) continue;
+      NumericDocValues year = DocValues.getNumeric(ctx.reader(), "year");
+      NumericDocValues ts = DocValues.getNumeric(ctx.reader(), "ts");
+      NumericDocValues pop = DocValues.getNumeric(ctx.reader(), "pop");
+      SortedDocValues kind = DocValues.getSorted(ctx.reader(), "kind");
+      bs.score(new org.apache.lucene.search.LeafCollector() {
+        @Override
+        public void setScorer(org.apache.lucene.search.Scorable scorer) {}
+
+        @Override
+        public void collect(int doc) throws IOException {
+          StringBuilder sb = new StringBuilder().append(ctx.docBase + doc);
+          if (r.nextInt(4) > 0 && year.docID() <= doc) sb.append(" y=").append(year.advanceExact(doc) ? year.longValue() : "-");
+          if (r.nextInt(3) > 0 && ts.docID() <= doc) sb.append(" t=").append(ts.advanceExact(doc) ? ts.longValue() : "-");
+          if (r.nextBoolean() && pop.docID() <= doc) sb.append(" p=").append(pop.advanceExact(doc) ? pop.longValue() : "-");
+          if (r.nextInt(4) > 0 && kind.docID() <= doc) {
+            sb.append(" k=").append(kind.advanceExact(doc) ? kind.lookupOrd(kind.ordValue()).utf8ToString() : "-");
+          }
+          if (r.nextInt(50) == 0 && year.docID() < DocIdSetIterator.NO_MORE_DOCS) {
+            // step off the matches: the next doc with a year, wherever it is
+            int next = year.nextDoc();
+            sb.append(" ny=").append(next).append(next == DocIdSetIterator.NO_MORE_DOCS ? "" : "/" + year.longValue());
+          }
+          out.add(sb.toString());
+        }
+      }, ctx.reader().getLiveDocs(), 0, DocIdSetIterator.NO_MORE_DOCS);
+    }
+    return out;
+  }
+
+  private static SortField sortField(Random r, int which) {
     boolean rev = r.nextBoolean(), withMissing = r.nextBoolean(), low = r.nextBoolean();
-    SortField sf = switch (r.nextInt(4)) {
+    return switch (which) {
       case 0 -> new SortField("year", SortField.Type.INT, rev,
           withMissing ? (low ? Integer.MIN_VALUE : Integer.MAX_VALUE) : null);
       case 1 -> new SortField("ts", SortField.Type.LONG, rev, withMissing ? (low ? Long.MIN_VALUE : Long.MAX_VALUE) : null);
@@ -437,17 +510,6 @@ public class TestLuxirSearch extends LuceneTestCase {
       default -> new SortField("kind", SortField.Type.STRING, rev,
           withMissing ? (low ? SortField.STRING_FIRST : SortField.STRING_LAST) : null);
     };
-    int k = 1 + r.nextInt(20);
-    Query full = LuxirSearch.withFilters(q, filters);
-    String info = full + " sort " + sf;
-    TopDocs expected = cs.search(full, new TopFieldCollectorManager(new Sort(sf), k, Integer.MAX_VALUE));
-    // without the match set, each segment's top k is kept as matches are found; with it, from its bits
-    boolean wantMatches = r.nextBoolean();
-    LuxirSearch.Result res = LuxirSearch.topKSorted(ls, q, filters, sf, k, null, wantMatches);
-    assertNotNull(info + ": " + LuxirSearch.whyNotNative(ls, q, filters), res);
-    assertEquals(info, expected.totalHits.value(), res.totalHits());
-    assertEquals(info, expected.scoreDocs.length, res.docs().length);
-    for (int i = 0; i < res.docs().length; i++) assertEquals(info + " rank " + i, expected.scoreDocs[i].doc, res.docs()[i]);
   }
 
   /** Native facet counts over a query's matches must equal counting Lucene's doc values. */

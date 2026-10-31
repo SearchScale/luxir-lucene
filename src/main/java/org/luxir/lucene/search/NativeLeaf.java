@@ -123,6 +123,15 @@ final class NativeLeaf {
 
   static final NativeColumn NO_COLUMN = new NativeColumn(MemorySegment.NULL, new byte[0], false);
 
+  /** The leaf's native doc-values reader; {@link MemorySegment#NULL} if its doc values are not native. */
+  @SuppressWarnings("unchecked")
+  static MemorySegment docValuesReader(LeafReader reader) {
+    if (!(unwrap(reader) instanceof org.apache.lucene.index.CodecReader cr)) return MemorySegment.NULL;
+    Object p = cr.getDocValuesReader();
+    if (!(p instanceof Supplier<?> s) || !p.getClass().getName().equals(NATIVE_DV)) return MemorySegment.NULL;
+    return ((Map<String, Object>) s.get()).get("reader") instanceof MemorySegment m ? m : MemorySegment.NULL;
+  }
+
   /** Whether none of {@code fields} has postings in this leaf (so the query matches nothing). */
   static boolean empty(LeafReader reader, Set<String> fields) throws IOException {
     LeafReader base = unwrap(reader);

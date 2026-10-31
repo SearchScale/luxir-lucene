@@ -12,6 +12,7 @@ import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
 import java.util.List;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.FieldInfo;
@@ -490,6 +491,122 @@ public final class LuxirSearch {
   }
 
   private record Candidate(int doc, long key, BytesRef term) {}
+
+  /**
+   * Whether {@link #topKSorted(IndexSearcher, Query, List, Sort, int, FixedBitSet, boolean, boolean,
+   * boolean)} can sort by {@code sort}: up to {@link LxlNative#MAX_SORT_KEYS} fields, each as
+   * {@link #sortSupported(IndexSearcher, SortField)}.
+   */
+  public static boolean sortSupported(IndexSearcher searcher, Sort sort) {
+    SortField[] fields = sort.getSort();
+    if (fields.length == 0 || fields.length > LxlNative.MAX_SORT_KEYS) return false;
+    for (SortField sf : fields) {
+      if (!sortSupported(searcher, sf)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * The top {@code k} matches by the fields of {@code sort} in turn, ties by doc id, computed
+   * natively (one field: as {@link #topKSorted(IndexSearcher, Query, List, SortField, int,
+   * FixedBitSet, boolean, boolean, boolean)}; more: Luxir finds the matches, then each segment's
+   * best k by its columns; Java merges). Scores are not computed (NaN). Null if the query, a filter
+   * or the sort cannot run natively.
+   */
+  public static Result topKSorted(IndexSearcher searcher, Query query, List<Query> filters, Sort sort, int k,
+      FixedBitSet filter, boolean filterCached, boolean wantMatches, boolean sparseMatches) throws IOException {
+    SortField[] fields = sort.getSort();
+    if (fields.length == 1) {
+      return topKSorted(searcher, query, filters, fields[0], k, filter, filterCached, wantMatches, sparseMatches);
+    }
+    if (!sortSupported(searcher, sort)) return null;
+    try (Arena arena = Arena.ofConfined()) {
+      Run all = run(searcher, query, filters, 0, Integer.MAX_VALUE, filter, filterCached, true, null, arena);
+      if (all == null) return null;
+      List<MultiCandidate> cands = new ArrayList<>();
+      if (k > 0 && all.total() > 0 && all.multi() != null) {
+        int n = fields.length;
+        List<LeafReaderContext> leaves = searcher.getIndexReader().leaves();
+        MemorySegment docsOut = arena.allocate(ValueLayout.JAVA_INT, k);
+        MemorySegment keysOut = arena.allocate(ValueLayout.JAVA_LONG, (long) k * n);
+        MemorySegment stores = arena.allocate(ValueLayout.ADDRESS, n);
+        MemorySegment names = arena.allocate(ValueLayout.ADDRESS, n);
+        MemorySegment nameLens = arena.allocate(ValueLayout.JAVA_INT, n);
+        MemorySegment kinds = arena.allocate(ValueLayout.JAVA_INT, n);
+        MemorySegment reverses = arena.allocate(ValueLayout.JAVA_INT, n);
+        MemorySegment missings = arena.allocate(ValueLayout.JAVA_LONG, n);
+        for (int i = 0; i < n; i++) {
+          kinds.setAtIndex(ValueLayout.JAVA_INT, i, sortKind(fields[i]));
+          reverses.setAtIndex(ValueLayout.JAVA_INT, i, fields[i].getReverse() ? 1 : 0);
+          missings.setAtIndex(ValueLayout.JAVA_LONG, i, missingKey(fields[i]));
+        }
+        for (int s = 0; s < all.segBits().length; s++) {
+          LeafReaderContext ctx = leaves.get(all.multi().leafOfSeg[s]);
+          int leafMax = ctx.reader().maxDoc();
+          SortedDocValues[] terms = new SortedDocValues[n];
+          for (int i = 0; i < n; i++) {
+            NativeLeaf.NativeColumn col = NativeLeaf.nativeColumn(ctx.reader(), fields[i].getField());
+            if (col == null) return null;
+            boolean none = col == NativeLeaf.NO_COLUMN || col.store().equals(MemorySegment.NULL);
+            stores.setAtIndex(ValueLayout.ADDRESS, i, none ? MemorySegment.NULL : col.store());
+            names.setAtIndex(ValueLayout.ADDRESS, i,
+                none ? MemorySegment.NULL : arena.allocateFrom(ValueLayout.JAVA_BYTE, col.column()));
+            nameLens.setAtIndex(ValueLayout.JAVA_INT, i, none ? 0 : col.column().length);
+            if (!none && fields[i].getType() == SortField.Type.STRING) {
+              terms[i] = ctx.reader().getSortedDocValues(fields[i].getField());
+            }
+          }
+          // the segment's match count is not known here; the total only picks the column iterators
+          NativeLeaf.Words m = new NativeLeaf.Words(all.segBits()[s], (int) Math.min(all.total(), leafMax));
+          int got;
+          try {
+            got = (int) LxlNative.COLUMNS_TOP_K.invokeExact(n, stores, names, nameLens, kinds, reverses, missings,
+                m.words(), m.count(), leafMax, k, docsOut, keysOut);
+          } catch (Throwable t) {
+            throw LxlNative.rethrow(t);
+          }
+          check(got);
+          for (int j = 0; j < got; j++) {
+            long[] keys = new long[n];
+            BytesRef[] strs = new BytesRef[n];
+            for (int i = 0; i < n; i++) {
+              keys[i] = keysOut.getAtIndex(ValueLayout.JAVA_LONG, (long) j * n + i);
+              if (terms[i] != null && keys[i] >= 0 && keys[i] != Long.MAX_VALUE) {
+                strs[i] = BytesRef.deepCopyOf(terms[i].lookupOrd((int) keys[i]));
+              }
+            }
+            cands.add(new MultiCandidate(ctx.docBase + docsOut.getAtIndex(ValueLayout.JAVA_INT, j), keys, strs));
+          }
+        }
+      }
+      Comparator<MultiCandidate> order = null;
+      for (int i = 0; i < fields.length; i++) {
+        int f = i;
+        boolean string = fields[i].getType() == SortField.Type.STRING;
+        Comparator<MultiCandidate> byValue = string
+            ? (a, b) -> {
+              // missing first (ord -1) or last (MAX_VALUE) around the values, as in sorted()
+              int ra = a.terms[f] != null ? 1 : a.keys[f] < 0 ? 0 : 2;
+              int rb = b.terms[f] != null ? 1 : b.keys[f] < 0 ? 0 : 2;
+              return ra != rb ? Integer.compare(ra, rb) : ra == 1 ? a.terms[f].compareTo(b.terms[f]) : 0;
+            }
+            : (a, b) -> Long.compare(a.keys[f], b.keys[f]);
+        if (fields[i].getReverse()) byValue = byValue.reversed();
+        order = order == null ? byValue : order.thenComparing(byValue);
+      }
+      cands.sort(order.thenComparingInt(c -> c.doc));
+      int n = Math.min(k, cands.size());
+      int[] docs = new int[n];
+      float[] scores = new float[n];
+      for (int i = 0; i < n; i++) {
+        docs[i] = cands.get(i).doc;
+        scores[i] = Float.NaN;
+      }
+      return all.result(searcher, docs, scores, true, wantMatches, sparseMatches);
+    }
+  }
+
+  private record MultiCandidate(int doc, long[] keys, BytesRef[] terms) {}
 
   /** How the sort's column keys order (see {@link LxlNative#SORT_LONG}). */
   private static int sortKind(SortField sf) {

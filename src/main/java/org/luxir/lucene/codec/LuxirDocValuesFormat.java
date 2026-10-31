@@ -17,6 +17,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.DocValuesConsumer;
 import org.apache.lucene.codecs.DocValuesFormat;
@@ -635,15 +636,20 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
 
   /** One field's sorted terms (thread-safe; lookups copy into the caller's buffer). */
   private static final class Terms {
+    // Dictionaries up to this many terms keep each term's bytes once looked up: grouping and
+    // collapsing look up a few ordinals once per match.
+    static final int CACHED_TERMS = 4096;
     final NativeStore.Opened store;
     final MemorySegment dict; // lxl_dict*, NULL with no terms
     final long count;
+    private final AtomicReferenceArray<byte[]> cache; // by ord, filled as looked up
 
     Terms(NativeStore.Opened store, int ord, long count) {
       this.store = store;
       if (count <= 0) {
         dict = MemorySegment.NULL;
         this.count = 0;
+        cache = null;
         return;
       }
       byte[] name = dictName(ord);
@@ -655,11 +661,25 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
       }
       if (got[0] != count) throw new IllegalStateException("term count mismatch: " + got[0] + " != " + count);
       this.count = count;
+      cache = count <= CACHED_TERMS ? new AtomicReferenceArray<>((int) count) : null;
     }
 
     /** Term {@code ord} into {@code out}, whose bytes array may be replaced. */
     void lookup(long ord, BytesRef out) {
       store.ensureOpen();
+      byte[] cached = cache == null ? null : cache.get((int) ord);
+      if (cached != null) {
+        if (out.bytes.length < cached.length) out.bytes = new byte[ArrayUtil.oversize(cached.length, 1)];
+        System.arraycopy(cached, 0, out.bytes, 0, cached.length);
+        out.offset = 0;
+        out.length = cached.length;
+        return;
+      }
+      nativeLookup(ord, out);
+      if (cache != null) cache.set((int) ord, Arrays.copyOf(out.bytes, out.length));
+    }
+
+    private void nativeLookup(long ord, BytesRef out) {
       for (;;) {
         int len;
         try {
@@ -691,6 +711,10 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
   /** Docs with values, fetched from the native column a block at a time. */
   private abstract static class Blocks {
     static final int BLOCK = 256;
+    // Docs per fill while targets skip most of each block (a sort or facet reading the values of
+    // sparse hits): every fill decodes all its docs, so blocks shrink while few of their docs are
+    // read and grow back as reads get denser.
+    static final int MIN_BLOCK = 8;
     final NativeStore.Opened store;
     final byte[] name; // the column's name in the store
     final Object owner;
@@ -700,10 +724,18 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
     private int fills;
     final long cost;
     int[] docs = new int[BLOCK];
+    int cap = BLOCK; // docs the next fill reads
+    int used; // docs of the block returned by advance
     int n; // docs in the block
     int i = -1; // current index in the block
     int doc = -1;
     boolean exhausted;
+    // The block holds a window of a query's matches (lxl_numeric_gather), each with or without a
+    // value: it answers advanceExact for those docs, nothing else.
+    boolean gathered;
+    // gathers that found no hinted window; past two, this iterator stops asking (its reads do not
+    // come from a native bulk scorer's matches)
+    private int unhinted;
 
     Blocks(NativeStore.Opened store, byte[] name, long cost, Object owner) {
       this.store = store;
@@ -714,6 +746,42 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
 
     /** Fills the block with docs >= target; returns the count. */
     abstract int fill(int target);
+
+    /**
+     * Fills the block with the calling thread's hinted matches from target on (see
+     * lxl_numeric_gather); 0 if target is not one of them or this column can't.
+     */
+    int gather(int target) {
+      return 0;
+    }
+
+    /** Whether the gathered doc at index j has a value. */
+    boolean present(int j) {
+      return true;
+    }
+
+    /** lxl_numeric_gather from target into the buffers. */
+    int nativeGather(int target, MemorySegment docs, MemorySegment present, MemorySegment values) {
+      try {
+        if (handle == null) {
+          handle = NativeHandle.register(owner, LxlNative.NUMERIC_FREE);
+          handle.set(check((MemorySegment) LxlNative.NUMERIC_NEW.invokeExact(store.reader(), heap(name), name.length)));
+        }
+        fills++;
+        return check((int) LxlNative.NUMERIC_GATHER.invokeExact(handle.get(), target, BLOCK, docs, present, values));
+      } catch (Throwable t) {
+        throw LxlNative.rethrow(t);
+      } finally {
+        Reference.reachabilityFence(owner);
+      }
+    }
+
+    private void leaveGathered() {
+      gathered = false;
+      n = 0;
+      i = -1;
+      exhausted = false;
+    }
 
     /** lxl_numeric_fill of docs >= target into the buffers; the first by a one-shot call. */
     int nativeFill(int target, MemorySegment docs, MemorySegment counts, MemorySegment values, int cap, int valueCap) {
@@ -744,23 +812,57 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
 
     int nextDoc() {
       if (doc == DocIdSetIterator.NO_MORE_DOCS) return doc;
+      if (gathered) leaveGathered();
       if (i + 1 < n) return doc = docs[++i];
+      cap = BLOCK; // reading every doc: full blocks
       if (!refill(doc + 1)) return doc = DocIdSetIterator.NO_MORE_DOCS;
       return doc = docs[0];
     }
 
     int advance(int target) {
+      if (gathered) leaveGathered();
       if (n > 0 && i < n && docs[n - 1] >= target) {
         int j = Math.max(i, 0);
         while (docs[j] < target) j++;
         i = j;
+        used++;
         return doc = docs[j];
       }
+      if (n > 0) {
+        if (used * 4 < n) cap = Math.max(MIN_BLOCK, cap >> 1);
+        else if (used * 2 > n) cap = Math.min(BLOCK, cap << 1);
+      }
+      used = 1;
       if (!refill(target)) return doc = DocIdSetIterator.NO_MORE_DOCS;
       return doc = docs[0];
     }
 
     boolean advanceExact(int target) {
+      if (gathered) {
+        if (target <= docs[n - 1]) {
+          int j = Math.max(i, 0);
+          while (docs[j] < target) j++;
+          if (docs[j] == target) {
+            i = j;
+            doc = target;
+            return present(j);
+          }
+        }
+        leaveGathered(); // past the window's gathered matches, or not one of them
+      }
+      if (unhinted < 2 && (n == 0 || i >= n || docs[n - 1] < target)) {
+        store.ensureOpen();
+        int got = gather(target);
+        if (got > 0) {
+          unhinted = 0;
+          gathered = true;
+          n = got;
+          i = 0;
+          doc = target;
+          return present(0);
+        }
+        unhinted++;
+      }
       int d = advance(target);
       if (d == target) return true;
       // stay before the next doc with a value, so nextDoc() still returns it
@@ -779,12 +881,23 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
   private static final class NativeNumeric extends NumericDocValues {
     private final Blocks blocks;
     private final long[] values = new long[Blocks.BLOCK];
+    private final int[] present = new int[Blocks.BLOCK];
 
     NativeNumeric(NativeStore.Opened store, byte[] name, long cost) {
       blocks = new Blocks(store, name, cost, this) {
         @Override
         int fill(int target) {
-          return check(nativeFill(target, heap(docs), MemorySegment.NULL, heap(values), BLOCK, BLOCK));
+          return check(nativeFill(target, heap(docs), MemorySegment.NULL, heap(values), cap, BLOCK));
+        }
+
+        @Override
+        int gather(int target) {
+          return nativeGather(target, heap(docs), heap(present), heap(values));
+        }
+
+        @Override
+        boolean present(int j) {
+          return present[j] != 0;
         }
       };
     }
@@ -834,7 +947,7 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
         int fill(int target) {
           int got;
           for (;;) {
-            got = nativeFill(target, heap(docs), heap(counts), heap(values), BLOCK, values.length);
+            got = nativeFill(target, heap(docs), heap(counts), heap(values), cap, values.length);
             if (got >= 0) break;
             String err = LxlNative.lastError();
             if (!err.contains("too small")) throw new LxlNative.LxlException(err);
