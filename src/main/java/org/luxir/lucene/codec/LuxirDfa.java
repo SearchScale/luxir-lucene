@@ -3,6 +3,7 @@
 
 package org.luxir.lucene.codec;
 
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -20,7 +21,31 @@ import org.luxir.lucene.LxlNative;
  */
 public record LuxirDfa(byte[] accepts, int[] offsets, int[] ranges, byte[] prefix, int initialState, byte[] suffix,
     byte[] startAfter) {
+  // The last automaton converted on this thread: an intersection over many segments (a multi-term
+  // query, a spell checker's fuzzy walk) converts it once, not once per segment.
+  private static final ThreadLocal<Object[]> LAST = new ThreadLocal<>();
+
   public static LuxirDfa of(CompiledAutomaton compiled, BytesRef startTerm) {
+    // The native dictionary holds terms of at most MAX_TERM bytes; for those, sorting after a longer
+    // start term is sorting after its first MAX_TERM bytes (a term equal to them is a prefix of it).
+    byte[] startAfter = startTerm == null ? null
+        : Arrays.copyOfRange(startTerm.bytes, startTerm.offset,
+            startTerm.offset + Math.min(startTerm.length, LxlNative.MAX_TERM));
+    Object[] last = LAST.get();
+    if (last != null && ((WeakReference<?>) last[0]).get() == compiled) {
+      LuxirDfa d = (LuxirDfa) last[1];
+      return d == null ? null : startAfter == null ? d : d.withStartAfter(startAfter);
+    }
+    LuxirDfa d = convert(compiled);
+    LAST.set(new Object[] {new WeakReference<>(compiled), d});
+    return d == null || startAfter == null ? d : d.withStartAfter(startAfter);
+  }
+
+  private LuxirDfa withStartAfter(byte[] startAfter) {
+    return new LuxirDfa(accepts, offsets, ranges, prefix, initialState, suffix, startAfter);
+  }
+
+  private static LuxirDfa convert(CompiledAutomaton compiled) {
     Automaton a = compiled.automaton;
     int n = a.getNumStates();
     if (n == 0) return null;
@@ -54,11 +79,6 @@ public record LuxirDfa(byte[] accepts, int[] offsets, int[] ranges, byte[] prefi
     }
     BytesRef cs = compiled.commonSuffixRef;
     byte[] suffix = cs == null ? new byte[0] : Arrays.copyOfRange(cs.bytes, cs.offset, cs.offset + cs.length);
-    // The native dictionary holds terms of at most MAX_TERM bytes; for those, sorting after a longer
-    // start term is sorting after its first MAX_TERM bytes (a term equal to them is a prefix of it).
-    byte[] startAfter = startTerm == null ? null
-        : Arrays.copyOfRange(startTerm.bytes, startTerm.offset,
-            startTerm.offset + Math.min(startTerm.length, LxlNative.MAX_TERM));
-    return new LuxirDfa(accepts, offsets, ranges, Arrays.copyOf(prefix, plen), state, suffix, startAfter);
+    return new LuxirDfa(accepts, offsets, ranges, Arrays.copyOf(prefix, plen), state, suffix, null);
   }
 }
