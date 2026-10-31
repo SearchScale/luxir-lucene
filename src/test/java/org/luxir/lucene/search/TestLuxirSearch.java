@@ -48,7 +48,15 @@ import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
+import org.apache.lucene.search.FieldExistsQuery;
+import org.apache.lucene.search.DisjunctionMaxQuery;
+import org.apache.lucene.search.MatchNoDocsQuery;
+import org.apache.lucene.queries.spans.SpanOrQuery;
 import org.apache.lucene.search.FuzzyQuery;
+import org.apache.lucene.search.similarities.Similarity;
+import org.apache.lucene.search.similarities.PerFieldSimilarityWrapper;
+import org.apache.lucene.search.similarities.ClassicSimilarity;
+import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.PhraseQuery;
 import org.apache.lucene.queries.spans.SpanNearQuery;
@@ -328,9 +336,29 @@ public class TestLuxirSearch extends LuceneTestCase {
             : new IndexOrDocValuesQuery(IntPoint.newSetQuery("year", v),
                 NumericDocValuesField.newSlowSetQuery("year", java.util.Arrays.stream(v).asLongStream().toArray()));
       }
-      long[] v = new long[1 + r.nextInt(40)];
-      for (int i = 0; i < v.length; i++) v[i] = 1_300_000_000_000L + r.nextInt(1_000_000_000);
-      return LongPoint.newSetQuery("ts", v);
+      switch (r.nextInt(3)) {
+        case 0: {
+          long[] v = new long[1 + r.nextInt(40)];
+          for (int i = 0; i < v.length; i++) v[i] = 1_300_000_000_000L + r.nextInt(1_000_000_000);
+          return LongPoint.newSetQuery("ts", v);
+        }
+        case 1: {
+          // float and double sets: values taken from the indexed distributions rarely hit exactly,
+          // so include -0f and +0f (distinct points) and whole numbers some docs may hold
+          float[] v = new float[1 + r.nextInt(20)];
+          for (int i = 0; i < v.length; i++) v[i] = r.nextInt(4) == 0 ? (r.nextBoolean() ? -0f : 0f) : (r.nextFloat() - 0.3f) * 1000;
+          return FloatPoint.newSetQuery("pop", v);
+        }
+        default: {
+          double[] v = new double[1 + r.nextInt(20)];
+          for (int i = 0; i < v.length; i++) v[i] = r.nextInt(3) == 0 ? r.nextInt(5) - 2 : r.nextGaussian() * 100;
+          return DoublePoint.newSetQuery("q", v);
+        }
+      }
+    }
+    if (r.nextInt(12) == 0) {
+      // field exists: points answer it natively
+      return new FieldExistsQuery(new String[] {"year", "ts", "pop", "q"}[r.nextInt(4)]);
     }
     switch (r.nextInt(5)) {
       case 0: {
@@ -560,6 +588,69 @@ public class TestLuxirSearch extends LuceneTestCase {
   }
 
   /** Returns whether the one-call native path ran. */
+  /**
+   * Searchers scoring with anything but BM25(1.2, 0.75) (Solr's per-field similarities, classic
+   * TF-IDF, tuned BM25): scored queries must fall back to Lucene, and every path must still return
+   * Lucene's hits and scores.
+   */
+  public void testOtherSimilaritiesMatchLucene() throws Exception {
+    Random r = random();
+    int numDocs = atLeast(2000);
+    Analyzer analyzer = new WhitespaceAnalyzer();
+    try (Directory luxDir = dir(r.nextBoolean());
+        Directory lucDir = newDirectory();
+        IndexWriter lux = new IndexWriter(luxDir, config(analyzer, new LuxirCodec(), 500, true));
+        IndexWriter luc = new IndexWriter(lucDir, config(analyzer, Codec.getDefault(), 500, true))) {
+      for (int i = 0; i < numDocs; i++) {
+        StringBuilder sb = new StringBuilder();
+        for (int j = 1 + r.nextInt(30); j > 0; j--) sb.append(word(r)).append(' ');
+        Document d = new Document();
+        d.add(new StringField("id", Integer.toString(i), Field.Store.YES));
+        d.add(new TextField("body", sb.toString(), Field.Store.NO));
+        if (r.nextInt(3) == 0) d.add(new TextField("title", word(r) + " " + word(r), Field.Store.NO));
+        lux.addDocument(d);
+        luc.addDocument(d);
+      }
+      lux.commit();
+      luc.commit();
+      Similarity tuned = new BM25Similarity(0.9f, 0.4f);
+      Similarity[] sims = {
+        new ClassicSimilarity(),
+        tuned,
+        new PerFieldSimilarityWrapper() {
+          @Override
+          public Similarity get(String name) {
+            return name.equals("title") ? tuned : new BM25Similarity();
+          }
+        }
+      };
+      try (DirectoryReader lr = DirectoryReader.open(luxDir);
+          DirectoryReader cr = DirectoryReader.open(lucDir)) {
+        for (Similarity sim : sims) {
+          IndexSearcher ls = new IndexSearcher(lr);
+          IndexSearcher cs = new IndexSearcher(cr);
+          ls.setSimilarity(sim);
+          cs.setSimilarity(sim);
+          ls.setQueryCache(null);
+          cs.setQueryCache(null);
+          for (int it = atLeast(40); it > 0; it--) {
+            Query q = randomQuery(r);
+            String info = sim + ": " + q;
+            TopDocs expected = cs.search(q, new TopScoreDocCollectorManager(10, Integer.MAX_VALUE));
+            TopDocs got = ls.search(new LuxirAcceleratedQuery(q), new TopScoreDocCollectorManager(10, Integer.MAX_VALUE));
+            assertEquals(info, expected.totalHits.value(), got.totalHits.value());
+            assertSameHits(info, expected.scoreDocs, got.scoreDocs);
+            LuxirSearch.Result res = LuxirSearch.topK(ls, q, 10, null, true);
+            if (res != null) {
+              assertEquals(info, expected.totalHits.value(), res.totalHits());
+              assertSameHits(info + " (topK)", expected.scoreDocs, toScoreDocs(res));
+            }
+          }
+        }
+      }
+    }
+  }
+
   private boolean check(Query q, IndexSearcher ls, IndexSearcher cs) throws IOException {
     String info = q.toString();
     // exact counts and all matches
@@ -579,7 +670,9 @@ public class TestLuxirSearch extends LuceneTestCase {
     if ((q instanceof WildcardQuery || q instanceof RegexpQuery) && ((AutomatonQuery) q).getField().equals("title")) {
       assertNotNull(info + ": automata run natively", res);
     }
-    if (q instanceof SpanNearQuery sn && distinctTerms(sn)) assertNotNull(info + ": ordered spans run natively", res);
+    if (q instanceof SpanNearQuery sn && sn.isInOrder() && distinctTerms(sn)) {
+      assertNotNull(info + ": ordered spans run natively", res);
+    }
     if (res == null) return false;
     assertEquals(info, expected.totalHits.value(), res.totalHits());
     ScoreDoc[] got = new ScoreDoc[res.docs().length];
@@ -607,7 +700,7 @@ public class TestLuxirSearch extends LuceneTestCase {
   private static boolean distinctTerms(SpanNearQuery q) {
     java.util.Set<Term> seen = new java.util.HashSet<>();
     for (SpanQuery c : q.getClauses()) {
-      if (!seen.add(((SpanTermQuery) c).getTerm())) return false;
+      if (!(c instanceof SpanTermQuery t) || !seen.add(t.getTerm())) return false;
     }
     return true;
   }
@@ -676,6 +769,66 @@ public class TestLuxirSearch extends LuceneTestCase {
           return new RegexpQuery(new Term(r.nextBoolean() ? "title" : "body", "w[0-9a-c][a-z0-9]?"));
         default:
           return new FuzzyQuery(new Term("body", w), 1 + r.nextInt(2));
+      }
+    }
+    if (r.nextInt(10) == 0) {
+      // Shapes that must run natively or fall back to Lucene with the same results
+      switch (r.nextInt(6)) {
+        case 0: {
+          // purely negative (matches nothing in Lucene), alone or required inside a boolean
+          BooleanQuery.Builder neg = new BooleanQuery.Builder();
+          neg.add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.MUST_NOT);
+          if (r.nextBoolean()) return neg.build();
+          return new BooleanQuery.Builder()
+              .add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.SHOULD)
+              .add(neg.build(), BooleanClause.Occur.MUST)
+              .build();
+        }
+        case 1: {
+          // nested booleans with negations and msm at more than one level
+          BooleanQuery.Builder outer = new BooleanQuery.Builder();
+          for (int i = 1 + r.nextInt(3); i > 0; i--) {
+            BooleanQuery.Builder inner = new BooleanQuery.Builder();
+            inner.add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.SHOULD);
+            inner.add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.SHOULD);
+            if (r.nextBoolean()) inner.add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.MUST_NOT);
+            if (r.nextInt(3) == 0) inner.setMinimumNumberShouldMatch(1 + r.nextInt(2));
+            outer.add(inner.build(), r.nextBoolean() ? BooleanClause.Occur.MUST : BooleanClause.Occur.SHOULD);
+          }
+          if (r.nextBoolean()) outer.add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.MUST_NOT);
+          if (r.nextInt(3) == 0) outer.add(MatchNoDocsQuery.INSTANCE, BooleanClause.Occur.SHOULD);
+          if (r.nextInt(3) == 0) outer.add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.FILTER);
+          return outer.build();
+        }
+        case 2: {
+          // unordered span near (Lucene's spans), and a span near nesting a span or
+          SpanQuery[] clauses = new SpanQuery[2 + r.nextInt(2)];
+          for (int i = 0; i < clauses.length; i++) clauses[i] = new SpanTermQuery(new Term("body", word(r)));
+          if (r.nextBoolean()) {
+            clauses[0] = new SpanOrQuery(new SpanTermQuery(new Term("body", word(r))), new SpanTermQuery(new Term("body", word(r))));
+            return new SpanNearQuery(clauses, r.nextInt(6), true);
+          }
+          return new SpanNearQuery(clauses, r.nextInt(6), false);
+        }
+        case 3: {
+          // dismax (edismax over several fields): Lucene scores it
+          List<Query> disjuncts = new ArrayList<>();
+          String w = word(r);
+          disjuncts.add(new TermQuery(new Term("body", w)));
+          disjuncts.add(new BoostQuery(new TermQuery(new Term("title", w)), 2f));
+          return new DisjunctionMaxQuery(disjuncts, r.nextBoolean() ? 0f : 0.1f);
+        }
+        case 4: {
+          // a phrase inside a boolean with a sloppy phrase and an ordered span
+          return new BooleanQuery.Builder()
+              .add(sloppyPhrase(r), BooleanClause.Occur.SHOULD)
+              .add(orderedNear(r), BooleanClause.Occur.SHOULD)
+              .add(new PhraseQuery("body", word(r), word(r)), r.nextBoolean() ? BooleanClause.Occur.SHOULD : BooleanClause.Occur.MUST_NOT)
+              .build();
+        }
+        default:
+          // a deep boost chain over a constant score
+          return new BoostQuery(new BoostQuery(new ConstantScoreQuery(new TermQuery(new Term("body", word(r)))), 2f), 0.25f + r.nextFloat());
       }
     }
     switch (r.nextInt(7)) {
