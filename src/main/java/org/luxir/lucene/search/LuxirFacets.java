@@ -15,6 +15,7 @@ import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 import org.luxir.lucene.LxlNative;
 
@@ -96,6 +97,66 @@ public final class LuxirFacets {
     default void expect(int n) {}
 
     void accept(long value, int count, int firstDoc) throws IOException;
+  }
+
+  /** Receives a segment's matches in doc order with their doc values. */
+  @FunctionalInterface
+  public interface DocValueSink {
+    /** {@code doc} within the segment; {@code value} (0 when absent) as the field's doc values hold it. */
+    void accept(int doc, boolean present, long value) throws IOException;
+  }
+
+  /**
+   * Passes each of a segment's matches (index-wide bits), in doc order, with its value of the
+   * single-valued NUMERIC field or ordinal of the SORTED field, read natively in batches; false (with
+   * nothing passed) if the field is not native there.
+   */
+  public static boolean docValues(LeafReaderContext ctx, String field, FixedBitSet matches, DocValueSink sink)
+      throws IOException {
+    NativeLeaf.NativeColumn col = NativeLeaf.nativeColumn(ctx.reader(), field);
+    if (col == null || col.multi()) return false;
+    int base = ctx.docBase, maxDoc = ctx.reader().maxDoc();
+    int end = Math.min(matches.length(), base + maxDoc);
+    if (col == NativeLeaf.NO_COLUMN || col.store().equals(MemorySegment.NULL)) {
+      for (int d = base < end ? matches.nextSetBit(base) : DocIdSetIterator.NO_MORE_DOCS; d < end;
+          d = d + 1 < end ? matches.nextSetBit(d + 1) : DocIdSetIterator.NO_MORE_DOCS) {
+        sink.accept(d - base, false, 0);
+      }
+      return true;
+    }
+    final int batch = 4096;
+    int[] docs = new int[batch], present = new int[batch];
+    long[] values = new long[batch];
+    MemorySegment c;
+    try {
+      c = check((MemorySegment) LxlNative.NUMERIC_NEW.invokeExact(col.store(), LxlNative.heap(col.column()),
+          col.column().length));
+    } catch (Throwable t) {
+      throw LxlNative.rethrow(t);
+    }
+    try {
+      int d = base < end ? matches.nextSetBit(base) : DocIdSetIterator.NO_MORE_DOCS;
+      while (d < end) {
+        int n = 0;
+        for (; n < batch && d < end; d = d + 1 < end ? matches.nextSetBit(d + 1) : DocIdSetIterator.NO_MORE_DOCS) {
+          docs[n++] = d - base;
+        }
+        try {
+          check((int) LxlNative.NUMERIC_VALUES.invokeExact(c, LxlNative.heap(docs), n, LxlNative.heap(present),
+              LxlNative.heap(values)));
+        } catch (Throwable t) {
+          throw LxlNative.rethrow(t);
+        }
+        for (int i = 0; i < n; i++) sink.accept(docs[i], present[i] != 0, values[i]);
+      }
+    } finally {
+      try {
+        LxlNative.NUMERIC_FREE.invokeExact(c);
+      } catch (Throwable t) {
+        throw LxlNative.rethrow(t);
+      }
+    }
+    return true;
   }
 
   /** Docs with a value sampled before {@link #valueCounts} judges the values mostly distinct. */

@@ -328,6 +328,10 @@ LXL_API int32_t lxl_numeric_gather(lxl_numeric* c, int32_t target, int32_t cap, 
                                    int32_t* present, int64_t* values);
 /* Gathers done (for tests). */
 LXL_API int64_t lxl_numeric_gathers(void);
+/* For n docs (ascending across calls, or rewinding), whether each has a value of the single-valued
+ * column (present) and the value. Returns n. */
+LXL_API int32_t lxl_numeric_values(lxl_numeric* c, const int32_t* docs, int32_t n, int32_t* present,
+                                   int64_t* values);
 /* As lxl_numeric_new, lxl_numeric_fill and lxl_numeric_free in one call: one block of the column's
  * docs >= target, without keeping an iterator. */
 LXL_API int32_t lxl_numeric_fill_once(lxl_reader* r, const char* name, int32_t name_len, int32_t target,

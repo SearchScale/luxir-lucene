@@ -3017,6 +3017,20 @@ int32_t lxl_numeric_gather(lxl_numeric* c, int32_t target, int32_t cap, int32_t*
 
 int64_t lxl_numeric_gathers(void) { return gathers.load(std::memory_order_relaxed); }
 
+int32_t lxl_numeric_values(lxl_numeric* c, const int32_t* docs, int32_t n, int32_t* present, int64_t* values) {
+  return guarded([&]() -> int32_t {
+    if (c->multi) return fail("lxl: values need a single-valued column");
+    auto& it = *c->it;
+    for (int32_t i = 0; i < n; i++) {
+      seekNumeric(c, docs[i]);
+      bool has = c->cur == docs[i];
+      present[i] = has;
+      values[i] = has ? it.value() : 0;
+    }
+    return n;
+  });
+}
+
 int32_t lxl_numeric_fill_once(lxl_reader* r, const char* name, int32_t name_len, int32_t target, int32_t* docs,
                               int32_t* counts, int64_t* values, int32_t cap, int32_t value_cap) {
   return guarded([&] {

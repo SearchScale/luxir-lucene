@@ -820,7 +820,33 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
     }
 
     int advance(int target) {
-      if (gathered) leaveGathered();
+      // a function's values (Lucene's numeric value sources) step with advance: a hinted match with
+      // a value is answered as advanceExact would; anything else needs the column's next doc
+      if (gathered) {
+        if (target <= docs[n - 1]) {
+          int j = Math.max(i, 0);
+          while (docs[j] < target) j++;
+          if (docs[j] == target && present(j)) {
+            i = j;
+            return doc = target;
+          }
+        }
+        leaveGathered();
+      }
+      if (unhinted < 2 && (n == 0 || i >= n || docs[n - 1] < target)) {
+        store.ensureOpen();
+        int got = gather(target);
+        if (got > 0) {
+          unhinted = 0;
+          gathered = true;
+          n = got;
+          i = 0;
+          if (present(0)) return doc = target;
+          leaveGathered();
+        } else {
+          unhinted++;
+        }
+      }
       if (n > 0 && i < n && docs[n - 1] >= target) {
         int j = Math.max(i, 0);
         while (docs[j] < target) j++;

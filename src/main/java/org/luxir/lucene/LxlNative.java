@@ -149,6 +149,8 @@ public final class LxlNative {
       fn("lxl_numeric_gather", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
           CRITICAL);
   public static final MethodHandle NUMERIC_GATHERS = fn("lxl_numeric_gathers", FunctionDescriptor.of(JAVA_LONG));
+  public static final MethodHandle NUMERIC_VALUES =
+      fn("lxl_numeric_values", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS), CRITICAL);
 
   /** Doc-value gathers of hinted matches done so far (for tests). */
   public static long numericGathers() {

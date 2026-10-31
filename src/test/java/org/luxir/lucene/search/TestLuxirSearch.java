@@ -482,7 +482,11 @@ public class TestLuxirSearch extends LuceneTestCase {
         public void collect(int doc) throws IOException {
           StringBuilder sb = new StringBuilder().append(ctx.docBase + doc);
           if (r.nextInt(4) > 0 && year.docID() <= doc) sb.append(" y=").append(year.advanceExact(doc) ? year.longValue() : "-");
-          if (r.nextInt(3) > 0 && ts.docID() <= doc) sb.append(" t=").append(ts.advanceExact(doc) ? ts.longValue() : "-");
+          if (r.nextInt(3) > 0 && ts.docID() <= doc) {
+            // as Lucene's numeric value sources read: advance to the doc, a value if it lands there
+            int at = ts.docID() < doc ? ts.advance(doc) : ts.docID();
+            sb.append(" t=").append(at == doc ? ts.longValue() : "-@" + at);
+          }
           if (r.nextBoolean() && pop.docID() <= doc) sb.append(" p=").append(pop.advanceExact(doc) ? pop.longValue() : "-");
           if (r.nextInt(4) > 0 && kind.docID() <= doc) {
             sb.append(" k=").append(kind.advanceExact(doc) ? kind.lookupOrd(kind.ordValue()).utf8ToString() : "-");
