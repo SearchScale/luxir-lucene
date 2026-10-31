@@ -713,6 +713,61 @@ public class TestLuxirSearch extends LuceneTestCase {
     }
   }
 
+  /**
+   * Field existence (by norms) where some docs' text has no tokens, alone, negated and counted, by
+   * every Lucene path: Luxir's norms must answer as Lucene's.
+   */
+  public void testFieldExistsWithEmptyText() throws Exception {
+    Random r = random();
+    int numDocs = atLeast(3000);
+    Analyzer analyzer = new WhitespaceAnalyzer();
+    try (Directory luxDir = dir(r.nextBoolean());
+        Directory lucDir = newDirectory();
+        IndexWriter lux = new IndexWriter(luxDir, config(analyzer, new LuxirCodec(), 700, r.nextBoolean()));
+        IndexWriter luc = new IndexWriter(lucDir, config(analyzer, Codec.getDefault(), 700, r.nextBoolean()))) {
+      for (int i = 0; i < numDocs; i++) {
+        Document d = new Document();
+        d.add(new StringField("id", Integer.toString(i), Field.Store.YES));
+        d.add(new TextField("body", word(r) + " " + word(r), Field.Store.NO));
+        // the title: absent, empty (no tokens) or a word
+        int t = r.nextInt(10);
+        if (t > 0) d.add(new TextField("title", t < 3 ? (r.nextBoolean() ? "" : "   ") : word(r), Field.Store.NO));
+        lux.addDocument(d);
+        luc.addDocument(d);
+      }
+      lux.commit();
+      luc.commit();
+      try (DirectoryReader lr = DirectoryReader.open(luxDir);
+          DirectoryReader cr = DirectoryReader.open(lucDir)) {
+        IndexSearcher ls = new IndexSearcher(lr), cs = new IndexSearcher(cr);
+        ls.setQueryCache(null);
+        cs.setQueryCache(null);
+        Query exists = new FieldExistsQuery("title");
+        Query[] queries = {
+          exists,
+          new BooleanQuery.Builder().add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.MUST)
+              .add(exists, BooleanClause.Occur.MUST_NOT).build(),
+          new BooleanQuery.Builder().add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.SHOULD)
+              .add(exists, BooleanClause.Occur.MUST_NOT).build(),
+          new BooleanQuery.Builder().add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.MUST)
+              .add(exists, BooleanClause.Occur.MUST_NOT).build(),
+          new BooleanQuery.Builder().add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.MUST)
+              .add(exists, BooleanClause.Occur.FILTER).build(),
+        };
+        for (Query q : queries) {
+          int want = cs.count(q);
+          assertEquals(q + " (count)", want, ls.count(q));
+          assertEquals(q + " (hits)", want,
+              ls.search(q, new TopScoreDocCollectorManager(1, Integer.MAX_VALUE)).totalHits.value());
+          assertEquals(q + " (accelerated count)", want, ls.count(new LuxirAcceleratedQuery(q)));
+          assertEquals(q + " (accelerated hits)", want,
+              ls.search(new LuxirAcceleratedQuery(q), new TopScoreDocCollectorManager(1, Integer.MAX_VALUE))
+                  .totalHits.value());
+        }
+      }
+    }
+  }
+
   private boolean check(Query q, IndexSearcher ls, IndexSearcher cs) throws IOException {
     String info = q.toString();
     // exact counts and all matches
