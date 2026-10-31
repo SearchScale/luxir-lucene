@@ -51,6 +51,7 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
@@ -1194,6 +1195,205 @@ class OrderedPhraseQuery final : public PhraseQuery {
   }
 };
 
+// Lucene's unordered SpanNearQuery over single distinct terms (node 15), as its SpanScorer counts
+// NearSpansUnordered: the terms' current positions sit in Lucene's priority queue (by start, then
+// end; the same binary heap, so ties resolve as there); a window matches when the span from the
+// queue's top to the furthest end, less the terms' lengths, is at most slop, and adds
+// 1 / (1 + (furthest end - top start)) to the frequency; then the top term moves to its next
+// position. A term running out of positions ends the document's matches.
+class UnorderedMatcher {
+  int32_t slop;
+  std::span<int32_t> order;    // slots, in query term order
+  std::span<int32_t> current;  // by query term order: current position
+  std::span<int32_t> heap;     // 1-based heap of query term indexes (Lucene's PriorityQueue)
+  int32_t size = 0;
+  int64_t maxEnd = -1;
+  float freq = 0.0f;
+  bool positioned = false;
+  bool freqComplete = true;
+
+  // Lucene's lessThan: by start, then end (each term spans one position)
+  bool lessThan(int32_t a, int32_t b) const { return current[(size_t)a] < current[(size_t)b]; }
+
+  void upHeap(int32_t i) {
+    int32_t node = heap[(size_t)i];
+    int32_t j = i >> 1;
+    while (j > 0 && lessThan(node, heap[(size_t)j])) {
+      heap[(size_t)i] = heap[(size_t)j];
+      i = j;
+      j >>= 1;
+    }
+    heap[(size_t)i] = node;
+  }
+
+  void downHeap(int32_t i) {
+    int32_t node = heap[(size_t)i];
+    int32_t j = i << 1;
+    int32_t k = j + 1;
+    if (k <= size && lessThan(heap[(size_t)k], heap[(size_t)j])) j = k;
+    while (j <= size && lessThan(heap[(size_t)j], node)) {
+      heap[(size_t)i] = heap[(size_t)j];
+      i = j;
+      j = i << 1;
+      k = j + 1;
+      if (k <= size && lessThan(heap[(size_t)k], heap[(size_t)j])) j = k;
+    }
+    heap[(size_t)i] = node;
+  }
+
+  bool atMatch() const {
+    int64_t total = (int64_t)order.size();  // each term's span is one position long
+    return maxEnd - (int64_t)current[(size_t)heap[1]] - total <= (int64_t)slop;
+  }
+
+  // the top term's next position; false when it has none
+  template <class S>
+  bool nextPosition(S& scorer) {
+    int32_t top = heap[1];
+    int32_t position = scorer.slotPosEnums[(size_t)order[(size_t)top]]->nextPosition();
+    if (position == PostingsReader::END) return false;
+    current[(size_t)top] = position;
+    maxEnd = std::max(maxEnd, (int64_t)position + 1);
+    downHeap(1);
+    return true;
+  }
+
+  // From a window that matched (or the document's start), the next matching window.
+  template <class S>
+  bool nextMatch(S& scorer) {
+    if (!positioned) return false;
+    for (;;) {
+      if (!nextPosition(scorer)) {
+        positioned = false;
+        return false;
+      }
+      if (atMatch()) return true;
+    }
+  }
+
+  void addMatch() {
+    double width = (double)(maxEnd - (int64_t)current[(size_t)heap[1]]);
+    freq = (float)((double)freq + 1.0 / (1.0 + width));
+  }
+
+ public:
+  static constexpr bool IS_SLOPPY = true;
+
+  explicit UnorderedMatcher(int32_t slop) : slop(slop) {}
+
+  template <class S>
+  void init(S& scorer) {
+    assert(scorer.groups.empty());
+    size_t n = scorer.slotEnums.size();
+    order = scorer.pool->template make_span<int32_t>(n);
+    current = scorer.pool->template make_span<int32_t>(n);
+    heap = scorer.pool->template make_span<int32_t>(n + 1);
+    for (size_t slot = 0; slot < n; slot++) order[(size_t)scorer.ordinals[slot]] = (int32_t)slot;
+  }
+
+  template <class S>
+  bool matches(S& scorer) {
+    freq = 0.0f;
+    freqComplete = true;
+    positioned = false;
+    if (scorer.docid == PostingsReader::END) return false;
+    if (scorer.minCompetitiveScore > 0.0f && scorer.simScorer != nullptr
+        && !PhraseQuery::ScorerControls::disableDocBoundForTests) {
+      // Every match after the first follows one move of a term: at most 1 + the sum of each
+      // term's tf - 1 of them, each weighing at most 1.
+      int64_t maxFreq = 1;
+      for (size_t term = 0; term < order.size(); term++) {
+        maxFreq += scorer.slotEnums[(size_t)order[term]]->termFreq() - 1;
+      }
+      if (scorer.simScorer->score(S::roundUpToFloat(maxFreq), scorer.lookupNorm(scorer.docid))
+          < scorer.minCompetitiveScore) {
+        skipCount(SkipStats::phraseBoundRejects);
+        return false;
+      }
+    }
+    skipCount(SkipStats::phraseVerifies);
+    for (auto* posEnum : scorer.conjunctionPosEnums) posEnum->startPositions();
+    // Lucene's startDocument: each term's first position, added to the queue in query order
+    size = 0;
+    maxEnd = -1;
+    for (size_t term = 0; term < order.size(); term++) {
+      int32_t position = scorer.slotPosEnums[(size_t)order[term]]->nextPosition();
+      if (position == PostingsReader::END) return false;
+      current[term] = position;
+      maxEnd = std::max(maxEnd, (int64_t)position + 1);
+      heap[(size_t)++size] = (int32_t)term;
+      upHeap(size);
+    }
+    positioned = true;
+    if (!atMatch() && !nextMatch(scorer)) return false;
+    addMatch();
+    freqComplete = false;
+    return true;
+  }
+
+  template <class S>
+  float scoreFreq(S& scorer) {
+    if (!freqComplete) {
+      while (nextMatch(scorer)) addMatch();
+      freqComplete = true;
+    }
+    return freq;
+  }
+
+  template <class S>
+  float getMaxScore(S& scorer, int32_t upTo) {
+    if (scorer.simScorer == nullptr) return 0.0f;
+    float tier1 = scorer.simScorer->internalWeight();
+    if (scorer.impacts.empty() || PhraseQuery::ScorerControls::disableRawBoundsForTests) return tier1;
+    int32_t startDoc = scorer.shallowTarget >= 0 ? scorer.shallowTarget : scorer.docid;
+    // as matches(): 1 + the sum of each term's tf - 1, each match weighing at most 1
+    int64_t freqBound = 1;
+    int32_t normLower = 0;
+    for (size_t i = 0; i < scorer.impacts.size(); i++) {
+      const ImpactsIndex& termImpacts = scorer.impacts[i];
+      int32_t startBlock = termImpacts.blockContaining(startDoc);
+      if (startBlock >= termImpacts.blockCount()) return tier1;
+      int32_t upBlock = termImpacts.blockContaining(upTo);
+      if (upBlock >= termImpacts.blockCount()) upBlock = termImpacts.blockCount() - 1;
+      if (upBlock < startBlock) return tier1;
+      ImpactsIndex::RawRange raw = termImpacts.rawRangeInRange(startBlock, upBlock);
+      if (raw.maxTf <= 0 || raw.minNorm == std::numeric_limits<int32_t>::max()) return tier1;
+      freqBound += (int64_t)scorer.impactMultiplicities[i] * ((int64_t)raw.maxTf - 1);
+      normLower = std::max(normLower, raw.minNorm);
+    }
+    return scorer.simScorer->score(S::roundUpToFloat(freqBound), normLower);
+  }
+};
+
+class UnorderedPhraseQuery final : public PhraseQuery {
+ public:
+  using PhraseQuery::PhraseQuery;
+
+  bool exactMatcher() const override { return false; }
+
+  uint64_t hashImpl() const override { return mixHash(PhraseQuery::hashImpl(), std::string_view("unordered")); }
+
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext& ctx) const override {
+    FilterKeyScope scope = PhraseQuery::appendFilterKey(out, ctx);
+    out.appendByte(2);  // unordered: not the phrase or the ordered near over the same terms
+    return scope;
+  }
+
+  Query::Scorer* makeScorer(MemPool& targetPool, std::span<DocsPosEnum*> slotEnums,
+                            std::span<PosEnum*> slotPosEnums, std::span<const int32_t> positions,
+                            std::span<const int32_t> ordinals, std::span<DocsPosEnum*> conjunctionEnums,
+                            std::span<PosEnum*> conjunctionPosEnums, NormsReader* normsReader,
+                            Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
+                            std::span<const int32_t> impactMultiplicities, std::span<const int32_t> slotGroup,
+                            std::span<RepeatGroup> groups, int64_t approximationCost, float matchCostEstimate,
+                            bool exclusionWindowFill) const override {
+    return targetPool.make<PhraseScorer<UnorderedMatcher>>(
+        targetPool, slotEnums, slotPosEnums, positions, ordinals, conjunctionEnums, conjunctionPosEnums,
+        normsReader, simScorer, impacts, impactMultiplicities, slotGroup, groups, approximationCost,
+        matchCostEstimate, getSlop(), exclusionWindowFill);
+  }
+};
+
 // A constant-score clause over a bitset the caller computed per segment (e.g. a numeric range
 // from the points index): AllQuery's shape with the bitset as its document source.
 class BitsetQuery final : public luxir::Query {
@@ -1602,7 +1802,16 @@ struct QueryParser {
         return pool.make<PhraseQuery>(field, std::span<std::string_view>(words, (size_t)n),
                                       std::span<const int32_t>(positions, (size_t)n), slop);
       }
-      case 12: {  // ordered span near over single distinct terms (Lucene's SpanNearQuery)
+      case 14: {  // disjunction max (Lucene's DisjunctionMaxQuery)
+        float tie = get<float>();
+        int32_t n = get<int32_t>();
+        if (n < 1) throw std::invalid_argument("lxl: dismax needs a disjunct");
+        std::span<Query*> disjuncts{pool.make_arr<Query*>((size_t)n), (size_t)n};
+        for (int32_t i = 0; i < n; i++) disjuncts[(size_t)i] = node();
+        return DisMaxQuery::make(pool, disjuncts, tie);
+      }
+      case 12:    // ordered span near over single distinct terms (Lucene's SpanNearQuery)
+      case 15: {  // the same, unordered
         std::string_view field = this->field();
         int32_t slop = get<int32_t>();
         int32_t n = get<int32_t>();
@@ -1620,6 +1829,10 @@ struct QueryParser {
           s.docFreq = get<int64_t>();
           s.totalTermFreq = get<int64_t>();
           terms.push_back({field, words[i], s});
+        }
+        if (kind == 15) {
+          return pool.make<UnorderedPhraseQuery>(field, std::span<std::string_view>(words, (size_t)n),
+                                                 std::span<const int32_t>(positions, (size_t)n), slop);
         }
         return pool.make<OrderedPhraseQuery>(field, std::span<std::string_view>(words, (size_t)n),
                                              std::span<const int32_t>(positions, (size_t)n), slop);

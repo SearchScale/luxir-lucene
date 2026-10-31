@@ -791,9 +791,8 @@ public class TestLuxirSearch extends LuceneTestCase {
     if ((q instanceof WildcardQuery || q instanceof RegexpQuery) && ((AutomatonQuery) q).getField().equals("title")) {
       assertNotNull(info + ": automata run natively", res);
     }
-    if (q instanceof SpanNearQuery sn && sn.isInOrder() && distinctTerms(sn)) {
-      assertNotNull(info + ": ordered spans run natively", res);
-    }
+    if (q instanceof SpanNearQuery sn && distinctTerms(sn)) assertNotNull(info + ": spans run natively", res);
+    if (q instanceof DisjunctionMaxQuery) assertNotNull(info + ": dismax runs natively", res);
     if (res == null) return false;
     assertEquals(info, expected.totalHits.value(), res.totalHits());
     ScoreDoc[] got = new ScoreDoc[res.docs().length];
@@ -845,10 +844,15 @@ public class TestLuxirSearch extends LuceneTestCase {
 
   /** An ordered span near of 2-3 terms (Solr's {!complexphrase inOrder=true}), some perhaps repeated. */
   private static Query orderedNear(Random r) {
-    int n = 2 + r.nextInt(2);
+    return near(r, true);
+  }
+
+  /** A span near of 2-4 terms, some perhaps repeated, in order or not. */
+  private static Query near(Random r, boolean inOrder) {
+    int n = 2 + r.nextInt(inOrder ? 2 : 3);
     SpanQuery[] clauses = new SpanQuery[n];
     for (int i = 0; i < n; i++) clauses[i] = new SpanTermQuery(new Term("body", word(r)));
-    return new SpanNearQuery(clauses, r.nextInt(13), true);
+    return new SpanNearQuery(clauses, r.nextInt(13), inOrder);
   }
 
   /** A sloppy phrase of 2-4 terms, some perhaps repeated, at perhaps gapped positions. */
@@ -973,11 +977,22 @@ public class TestLuxirSearch extends LuceneTestCase {
       case 3:
         return new PhraseQuery("body", word(r), word(r));
       case 4:
-        switch (r.nextInt(3)) {
+        switch (r.nextInt(5)) {
           case 0:
             return new PhraseQuery(r.nextInt(3), "body", word(r), word(r));
           case 1:
             return sloppyPhrase(r);
+          case 2: {
+            // dismax over fields and phrases (edismax's per-term and phrase-field clauses)
+            List<Query> disjuncts = new ArrayList<>();
+            String w = word(r);
+            disjuncts.add(new TermQuery(new Term("body", w)));
+            disjuncts.add(new BoostQuery(new TermQuery(new Term("title", w)), 1 + 3 * r.nextFloat()));
+            if (r.nextBoolean()) disjuncts.add(new PhraseQuery("body", w, word(r)));
+            return new DisjunctionMaxQuery(disjuncts, r.nextInt(3) == 0 ? 0f : r.nextFloat());
+          }
+          case 3:
+            return near(r, false);
           default:
             return orderedNear(r);
         }

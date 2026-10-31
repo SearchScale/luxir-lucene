@@ -23,6 +23,7 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.CollectionStatistics;
 import org.apache.lucene.search.ConstantScoreQuery;
+import org.apache.lucene.search.DisjunctionMaxQuery;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.IndexOrDocValuesQuery;
 import org.apache.lucene.search.IndexSearcher;
@@ -51,7 +52,7 @@ import org.luxir.lucene.codec.LuxirDfa;
  * BM25 statistics so native scores equal Lucene's.
  *
  * <p>Supported: TermQuery, BooleanQuery (any occurs and minimumShouldMatch, not purely negative),
- * BoostQuery, ConstantScoreQuery, PhraseQuery, ordered SpanNearQuery of single distinct terms,
+ * BoostQuery, ConstantScoreQuery, DisjunctionMaxQuery, PhraseQuery, SpanNearQuery of single distinct terms,
  * MatchAll/MatchNoDocsQuery, constant-score prefix, over fields scored by
  * BM25Similarity(1.2, 0.75); and, where the caller evaluates them ({@code ranges}), one-dimensional
  * point ranges (PointRangeQuery, alone or as IndexOrDocValuesQuery's index side) as constant-score
@@ -66,7 +67,8 @@ import org.luxir.lucene.codec.LuxirDfa;
  * numeric range (slot, lo, hi) over the caller's per-segment doc-values column [slot], 11
  * constant-score term set (field, n, then n sorted unique terms), 12 ordered span near (field, slop,
  * n, then n x (term, docFreq, ttf)), 13 constant-score byte DFA (field, states, accept flags,
- * states + 1 range offsets, (min, max, dest) ranges, prefix, initial state, suffix). Strings are an int length and bytes.
+ * states + 1 range offsets, (min, max, dest) ranges, prefix, initial state, suffix), 14 disjunction
+ * max (tie, n, then n disjuncts), 15 unordered span near (as 12). Strings are an int length and bytes.
  */
 public final class LxlQuery {
   private static final int MAGIC = 0x3151584c; // "LXQ1"
@@ -412,12 +414,13 @@ public final class LxlQuery {
       return node(c.getQuery());
     }
     if (LxlSpans.AVAILABLE) {
-      LxlSpans.OrderedNear near = LxlSpans.orderedTermNear(q);
+      LxlSpans.TermNear near = LxlSpans.termNear(q);
       if (near != null) {
-        // Lucene's ordered SpanNearQuery of single distinct terms (Solr's {!complexphrase}):
-        // Luxir's phrase scorer with Lucene's NearSpansOrdered matching and span frequency
+        // Lucene's SpanNearQuery of single distinct terms (Solr's {!complexphrase}): Luxir's
+        // phrase scorer with Lucene's NearSpansOrdered or NearSpansUnordered matching and span
+        // frequency
         if (!field(near.field())) return false;
-        body.write(12);
+        body.write(near.inOrder() ? 12 : 15);
         str(near.field().getBytes(StandardCharsets.UTF_8));
         i32(near.slop());
         i32(near.terms().length);
@@ -428,6 +431,16 @@ public final class LxlQuery {
         }
         return true;
       }
+    }
+    if (q instanceof DisjunctionMaxQuery dm) {
+      // Luxir's dis_max: the best disjunct's score plus tie times the others', as Lucene's
+      body.write(14);
+      f32(dm.getTieBreakerMultiplier());
+      i32(dm.getDisjuncts().size());
+      for (Query d : dm.getDisjuncts()) {
+        if (!node(d)) return false;
+      }
+      return true;
     }
     if (q instanceof PhraseQuery pq) {
       Term[] terms = pq.getTerms();

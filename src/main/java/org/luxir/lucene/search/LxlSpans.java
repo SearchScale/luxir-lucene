@@ -29,12 +29,12 @@ final class LxlSpans {
     }
   }
 
-  /** An ordered SpanNearQuery's field, slop and terms, in order. */
-  record OrderedNear(String field, int slop, Term[] terms) {}
+  /** A SpanNearQuery's field, slop, terms (in query order) and whether they must be in order. */
+  record TermNear(String field, int slop, Term[] terms, boolean inOrder) {}
 
-  /** An ordered SpanNearQuery of two or more single distinct terms, or null. */
-  static OrderedNear orderedTermNear(Query q) {
-    if (!(q instanceof SpanNearQuery near) || !near.isInOrder() || near.getSlop() < 0) return null;
+  /** A SpanNearQuery (ordered or not) of two or more single distinct terms, or null. */
+  static TermNear termNear(Query q) {
+    if (!(q instanceof SpanNearQuery near) || near.getSlop() < 0) return null;
     SpanQuery[] clauses = near.getClauses();
     if (clauses.length < 2) return null;
     Term[] terms = new Term[clauses.length];
@@ -44,6 +44,6 @@ final class LxlSpans {
       terms[i] = st.getTerm();
       if (!terms[i].field().equals(near.getField()) || !seen.add(terms[i])) return null;
     }
-    return new OrderedNear(near.getField(), near.getSlop(), terms);
+    return new TermNear(near.getField(), near.getSlop(), terms, near.isInOrder());
   }
 }
