@@ -1,7 +1,7 @@
-From 5e2e372d5406552bf0c68bce6fd93a42ded4295e Mon Sep 17 00:00:00 2001
+From 26bc3a048931e5e80f20ad9449a3a385e075ada0 Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@searchscale.com>
 Date: Fri, 23 Oct 2026 22:24:38 +0530
-Subject: [PATCH 2/5] query: answer sparse range verification from block
+Subject: [PATCH 2/4] query: answer sparse range verification from block
  relations
 
 A numeric range verified per candidate behind a selective lead read every
@@ -14,10 +14,10 @@ read. Values that cluster by doc (time-ordered data) leave few of them.
  1 file changed, 22 insertions(+), 3 deletions(-)
 
 diff --git a/src/luxir/query/NumericPredicateQuery.h b/src/luxir/query/NumericPredicateQuery.h
-index a709f803..963cd8c4 100644
+index b1930f1f..4cb5b534 100644
 --- a/src/luxir/query/NumericPredicateQuery.h
 +++ b/src/luxir/query/NumericPredicateQuery.h
-@@ -219,6 +219,11 @@ public:
+@@ -203,6 +203,11 @@ public:
      bool allMatch;
      bool multi;
      int32_t docid = -1;
@@ -29,7 +29,7 @@ index a709f803..963cd8c4 100644
  
      LUXIR_INLINE void observe(int32_t doc) {
  #ifndef NDEBUG
-@@ -232,6 +237,17 @@ public:
+@@ -216,6 +221,17 @@ public:
        observe(doc);
        if (!multi) {
          if (allMatch) return true;
@@ -47,7 +47,7 @@ index a709f803..963cd8c4 100644
          return query.matchesValue(iter.values().valueAt(rank));
        }
        auto [start, end] = reader.getStartEndValueRank(rank);
-@@ -264,9 +280,11 @@ public:
+@@ -248,9 +264,11 @@ public:
    public:
      PredicateScorer(IntColReader& reader, const NumericPredicateQuery& query,
                  bool allMatch,
@@ -61,7 +61,7 @@ index a709f803..963cd8c4 100644
  
      [[gnu::cold]] void reset() override {
        iter.reset();
-@@ -1307,7 +1325,8 @@ public:
+@@ -1628,7 +1646,8 @@ public:
              return targetPool.make<
                  PredicateScorer<IntColReader::SparseIterator>>(
                      reader, weight.query,

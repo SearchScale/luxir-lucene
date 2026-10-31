@@ -1,7 +1,7 @@
-From 1622006e90651e7f2f87400725c4f248cfccf469 Mon Sep 17 00:00:00 2001
+From a54d5ac7edab6d8db45adb1bb09b7a1cb2159a7b Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@apache.org>
 Date: Tue, 20 Oct 2026 19:36:48 +0530
-Subject: [PATCH 1/5] query: skip term windows without docs when counting
+Subject: [PATCH 1/4] query: skip term windows without docs when counting
 
 Without a window filter, TermBulkScorer's count and match windows now
 start at the window holding the term's next doc instead of stepping
@@ -12,7 +12,7 @@ longer walks thousands of windows that hold none of its docs.
  1 file changed, 23 insertions(+)
 
 diff --git a/src/luxir/query/TermQuery.h b/src/luxir/query/TermQuery.h
-index b3de99a7..97cbae2c 100644
+index f1fc3773..19b2c1e2 100644
 --- a/src/luxir/query/TermQuery.h
 +++ b/src/luxir/query/TermQuery.h
 @@ -1231,6 +1231,20 @@ public:

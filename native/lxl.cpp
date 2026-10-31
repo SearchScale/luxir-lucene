@@ -1391,25 +1391,6 @@ public:
     // or a single-valued range counted from its points), else -1.
     std::span<int64_t> exactCounts;
 
-
-    // NumericPredicateQuery::Weight's cost estimate from block relations
-    static int64_t estimateCost(IntColReader& reader, std::span<const NumericPredicateQuery::BlockPlan> plans,
-                                bool exactSet) {
-      int64_t estimate = 0;
-      for (int64_t b = 0; b < reader.numBlocks(); b++) {
-        plans[(size_t)b].forEachRun((uint32_t)reader.valuesInBlock(b),
-                                    [&](NumericPredicateQuery::BlockRelation relation, uint32_t begin, uint32_t end) {
-                                      int64_t count = end - begin;
-                                      if (relation == NumericPredicateQuery::BlockRelation::INSIDE) {
-                                        estimate += count;
-                                      } else if (relation == NumericPredicateQuery::BlockRelation::CROSSES) {
-                                        estimate += exactSet ? count : (count + 1) / 2;
-                                      }
-                                    });
-      }
-      return std::min<int64_t>(estimate, reader.docsWithValue());
-    }
-
   public:
     Weight(Context& context, ColumnRangeQuery& query, int32_t flags, float multiplier)
         : Query::Weight(context, query, flags), query(query) {
@@ -1432,7 +1413,7 @@ public:
       int64_t colMin = reader->getMin(), colMax = reader->getMax();
       auto& pred = query.predicate;
       if (colMax < pred.getLo() || pred.getHi() < colMin) return nullptr;
-      std::span<NumericPredicateQuery::BlockPlan> plans;  // the supplier classifies on demand when points answer
+      std::optional<NumColumnFormat::LeafMeta::RangeSummary> summary;  // without points, as NumericPredicateQuery prices it
       bool allMatch = pred.covers(colMin, colMax);
       int64_t cost = 0;
       PointsReader* points = e->points;
@@ -1457,17 +1438,20 @@ public:
         matchState = pointValueCount == 0 ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
       } else {
         points = nullptr;
-        plans = NumericPredicateQuery::classifyBlocks(targetPool, *reader, pred);
-        cost = estimateCost(*reader, plans, pred.isExactSet());
-        bool hasInside = NumericPredicateQuery::hasInsideRun(*reader, plans), hasCrosses = false;
-        for (const auto& plan : plans) hasCrosses |= plan.relation == NumericPredicateQuery::BlockRelation::CROSSES;
-        matchState = hasInside ? Query::MatchState::NONEMPTY
-                     : hasCrosses ? Query::MatchState::UNKNOWN
-                                  : Query::MatchState::EMPTY;
+        summary = reader->leafMeta().summarizeRange(pred.getLo(), pred.getHi());
+        // An exact set's envelope proves rejection, never inclusion in gaps.
+        if (pred.isExactSet() && !allMatch) summary->insideLower = summary->insideUpper = 0;
+        int64_t possible = reader->numValues() - summary->outside;
+        int64_t estimate = pred.isExactSet() ? possible
+            : summary->insideLower + (possible - summary->insideLower + 1) / 2;
+        cost = std::min<int64_t>(estimate, reader->docsWithValue());
+        matchState = possible == 0 ? Query::MatchState::EMPTY
+                     : summary->insideLower > 0 ? Query::MatchState::NONEMPTY
+                                                : Query::MatchState::UNKNOWN;
       }
       exactCounts[(size_t)segment.ord] = allMatch ? reader->docsWithValue()
           : points != nullptr && !reader->multiValued() ? (int64_t)pointValueCount : -1;
-      return targetPool.make<NumericPredicateQuery::Weight::Supplier>(*inner, targetPool, segment, *reader, plans,
+      return targetPool.make<NumericPredicateQuery::Weight::Supplier>(*inner, targetPool, segment, *reader, summary,
                                                                      cost, matchState, allMatch, points, pointRanges,
                                                                      pointValueCount);
     }

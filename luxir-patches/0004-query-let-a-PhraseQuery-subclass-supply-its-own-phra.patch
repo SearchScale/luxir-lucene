@@ -1,7 +1,7 @@
-From e96a72dffc8bead79a676da0f213c0cbe9a33962 Mon Sep 17 00:00:00 2001
+From 21bfab5eb298529834526601c6dc3224b5e9d94f Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@searchscale.com>
 Date: Tue, 27 Oct 2026 01:27:07 +0530
-Subject: [PATCH 5/5] query: let a PhraseQuery subclass supply its own phrase
+Subject: [PATCH 4/4] query: let a PhraseQuery subclass supply its own phrase
  scorer
 
 PhraseQuery is no longer final. Its Weight assembles one segment's postings,
@@ -19,10 +19,10 @@ dynamic type, so a subclass never shares a plain phrase's cache entries.
  2 files changed, 43 insertions(+), 13 deletions(-)
 
 diff --git a/src/luxir/query/BooleanWeight.h b/src/luxir/query/BooleanWeight.h
-index 2a312ca2..12f523d6 100644
+index 5977167f..1ed1f80a 100644
 --- a/src/luxir/query/BooleanWeight.h
 +++ b/src/luxir/query/BooleanWeight.h
-@@ -7672,7 +7672,7 @@ class BooleanQuery::Weight final : public Query::Weight {
+@@ -7742,7 +7742,7 @@ class BooleanQuery::Weight final : public Query::Weight {
        return true;
      }
      return query->getKind() == QueryKind::PHRASE
@@ -32,7 +32,7 @@ index 2a312ca2..12f523d6 100644
  
    static bool lessMaxScore(float a, float b) {
 diff --git a/src/luxir/query/PhraseQuery.h b/src/luxir/query/PhraseQuery.h
-index 35a9c31e..000330c3 100644
+index 3f8ed79f..1513c980 100644
 --- a/src/luxir/query/PhraseQuery.h
 +++ b/src/luxir/query/PhraseQuery.h
 @@ -10,6 +10,7 @@
@@ -109,7 +109,7 @@ index 35a9c31e..000330c3 100644
            (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
      }
  
-@@ -1634,4 +1644,24 @@ public:
+@@ -1650,4 +1660,24 @@ public:
    };
  };
  
