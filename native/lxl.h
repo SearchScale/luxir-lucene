@@ -28,7 +28,7 @@ extern "C" {
 
 #define LXL_API __attribute__((visibility("default")))
 
-#define LXL_ABI_VERSION 7
+#define LXL_ABI_VERSION 8
 #define LXL_MAX_TERM 255
 #define LXL_END INT32_MAX
 
@@ -246,10 +246,12 @@ LXL_API int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t quer
                                 int32_t num_cols, lxl_reader* const* col_stores,
                                 const char* const* col_names, lxl_points* const* col_points,
                                 const int64_t* col_offsets, int32_t* match_docs, int32_t match_docs_cap,
-                                int32_t* seg_match_counts);
+                                int32_t* seg_match_counts, int32_t* resume);
 /* With match_docs (and no match_bits) lxl_multi_top_k lists the matches instead: segment-local docs
  * in segment order, seg_match_counts[i] of them for segment i (zeroed by the caller); more than
- * match_docs_cap of them returns LXL_MATCHES_OVERFLOW, for the caller to ask for bits instead. */
+ * match_docs_cap of them returns LXL_MATCHES_OVERFLOW, with the segment and doc it stopped at in
+ * resume[0..1]. Called again as it was, now with match_bits as well, it sets the listed docs' bits
+ * and goes on from there, rather than walking those matches again. */
 #define LXL_MATCHES_OVERFLOW (-2)
 
 /* ---- stored values, numeric columns and points ------------------------------------

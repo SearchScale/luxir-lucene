@@ -2272,7 +2272,7 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
                         const uint64_t* const* slot_bits, const int32_t* slot_counts, int32_t num_cols,
                         lxl_reader* const* col_stores, const char* const* col_names,
                         lxl_points* const* col_points, const int64_t* col_offsets, int32_t* match_docs,
-                        int32_t match_docs_cap, int32_t* seg_match_counts) {
+                        int32_t match_docs_cap, int32_t* seg_match_counts, int32_t* resume) {
   return guarded([&]() -> int32_t {
     MultiCall call(m, query, query_len, live, num_live, num_slots, slot_bits, slot_counts, num_cols, col_stores,
                    col_names, col_points, col_offsets);
@@ -2283,15 +2283,30 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
 
     int64_t count = -1;
     bool exact = true;
-    // listing: the matches as segment-local docs in segment order, up to match_docs_cap
-    bool listing = match_docs != nullptr;
+    // listing: the matches as segment-local docs in segment order, up to match_docs_cap; resuming:
+    // bits after an overflow, for the listed docs and then on from where the listing stopped
+    bool resuming = match_docs != nullptr && match_bits != nullptr;
+    bool listing = match_docs != nullptr && !resuming;
     int32_t listed = 0;
     bool overflow = false;
+    size_t startSeg = 0;
+    int32_t startDoc = 0;
     if (match_bits != nullptr || listing) count_limit = -1;
     if (count_limit != 0) {
       count = 0;
       auto* w = prepared.weight(0);
-      for (size_t i = 0; i < n; i++) {
+      if (resuming) {
+        startSeg = (size_t)resume[0];
+        startDoc = resume[1];
+        for (size_t i = 0, at = 0; i < n; at += (size_t)seg_match_counts[i], i++) {
+          for (int32_t j = 0; j < seg_match_counts[i]; j++) {
+            int32_t d = match_docs[at + (size_t)j];
+            match_bits[i][d >> 6] |= 1ULL << (d & 63);
+          }
+          count += seg_match_counts[i];
+        }
+      }
+      for (size_t i = startSeg; i < n; i++) {
         if (count_limit > 0 && count >= count_limit) {
           exact = false;
           break;
@@ -2308,6 +2323,8 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
           if (listing) {
             if (listed == match_docs_cap) {
               overflow = true;
+              resume[0] = (int32_t)i;
+              resume[1] = d;
               return;
             }
             match_docs[listed++] = d;
@@ -2335,7 +2352,7 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
             }
           }
         } else if (bulk != nullptr) {
-          int32_t cursor = 0;
+          int32_t cursor = i == startSeg ? startDoc : 0;
           while (cursor != PostingsReader::END && cursor < seg.maxDoc()) {
             ScoreWindow window;
             int32_t next = bulk->matchNextWindow(window, filter, cursor, seg.maxDoc());
@@ -2345,13 +2362,14 @@ int32_t lxl_multi_top_k(lxl_multi* m, const uint8_t* query, int64_t query_len,
             cursor = next;
           }
         } else if (auto* s = pullScorer(prepared.pool, *supplier)) {
-          for (int32_t d = s->next(); d != PostingsReader::END; d = s->next()) {
+          int32_t first = i == startSeg && startDoc > 0 ? s->advance(startDoc) : s->next();
+          for (int32_t d = first; d != PostingsReader::END; d = s->next()) {
             if (filter != nullptr && !filter->get(d)) continue;
             if (collect) add(d);
             if (overflow || ++count == count_limit) break;
           }
         }
-        if (overflow) return LXL_MATCHES_OVERFLOW;  // the caller asks again for bits
+        if (overflow) return LXL_MATCHES_OVERFLOW;  // the caller resumes with bits
       }
     }
 

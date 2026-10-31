@@ -26,7 +26,7 @@ import java.nio.file.Path;
  * copying; long-running calls (segment writing, top-k) are linked normally.
  */
 public final class LxlNative {
-  public static final int ABI_VERSION = 7;
+  public static final int ABI_VERSION = 8;
   public static final int MAX_TERM = 255;
   public static final int END = Integer.MAX_VALUE;
   public static final int TERM_START = 1;
@@ -291,7 +291,7 @@ public final class LxlNative {
       fn("lxl_multi_top_k",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, JAVA_LONG, ADDRESS,
               ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS,
-              ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS));
+              ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS));
   /** lxl_multi_top_k's return when the listed matches would exceed their buffer. */
   public static final int MATCHES_OVERFLOW = -2;
   public static final MethodHandle MULTI_TOP_K_SORTED =

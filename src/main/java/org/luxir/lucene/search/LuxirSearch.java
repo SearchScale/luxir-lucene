@@ -326,18 +326,19 @@ public final class LuxirSearch {
       int listCap = listing ? (searcher.getIndexReader().maxDoc() >> 6) + 4 : 0;
       MemorySegment listedDocs = listing ? arena.allocate(ValueLayout.JAVA_INT, listCap) : MemorySegment.NULL;
       MemorySegment segCounts = listing ? arena.allocate(ValueLayout.JAVA_INT, Math.max(1, n)) : MemorySegment.NULL;
+      MemorySegment resume = listing ? arena.allocate(ValueLayout.JAVA_INT, 2) : MemorySegment.NULL;
       int got;
       try {
         got = (int) LxlNative.MULTI_TOP_K.invokeExact(multi.handle, q, (long) enc.bytes().length, live, numLive, k,
             limit, segsOut, docsOut, scoresOut, totalOut, exactOut, bits, numSlots, slotBits, slotCounts, numCols,
-            colStores, colNames, colPoints, colOffsets, listedDocs, listCap, segCounts);
+            colStores, colNames, colPoints, colOffsets, listedDocs, listCap, segCounts, resume);
         if (got == LxlNative.MATCHES_OVERFLOW) {
-          // too many to list: each segment's bits after all
+          // too many to list: each segment's bits after all, the listed ones and on from where listing stopped
           listing = false;
           bits = segmentBits(leaves, multi, segBits, arena);
           got = (int) LxlNative.MULTI_TOP_K.invokeExact(multi.handle, q, (long) enc.bytes().length, live, numLive,
               k, limit, segsOut, docsOut, scoresOut, totalOut, exactOut, bits, numSlots, slotBits, slotCounts,
-              numCols, colStores, colNames, colPoints, colOffsets, MemorySegment.NULL, 0, MemorySegment.NULL);
+              numCols, colStores, colNames, colPoints, colOffsets, listedDocs, listCap, segCounts, resume);
         }
       } catch (Throwable t) {
         throw LxlNative.rethrow(t);
