@@ -30,6 +30,10 @@ final class LuxirNormsFormat extends NormsFormat {
   static final String NORMS_KEY = "luxir.norms";
   static final String IN_LUXIR = "luxir";
   static final String IN_LUCENE = "lucene";
+  // A flushed segment's field whose Lucene norms (zero for every doc: Lucene saw no tokens) were
+  // written too: they say which docs have the field, text without tokens included, which Luxir's
+  // norm bytes (0: no tokens) cannot.
+  static final String PRESENCE_KEY = "luxir.norms.presence";
 
   private final NormsFormat delegate;
   private final LuxirPostingsFormat postings;
@@ -46,8 +50,11 @@ final class LuxirNormsFormat extends NormsFormat {
       @Override
       public void addNormsField(FieldInfo field, NormsProducer norms) throws IOException {
         if (LuxirTextField.isNative(field) && NativeIndexer.get(state.segmentInfo) != null) {
-          // flushed segment: Lucene saw no tokens; the norms are in the Luxir segment
+          // flushed segment: Lucene saw no tokens; the norms are in the Luxir segment, and Lucene's
+          // (all zero, so nearly free to keep) give the docs that have the field
           field.putAttribute(NORMS_KEY, IN_LUXIR);
+          field.putAttribute(PRESENCE_KEY, "1");
+          in.addNormsField(field, norms);
           return;
         }
         if (LuxirTextField.isNative(field)) field.putAttribute(NORMS_KEY, IN_LUCENE); // merged
@@ -109,6 +116,10 @@ final class LuxirNormsFormat extends NormsFormat {
         norms = luxir().norms(field.name);
         nativeNorms.put(field.name, norms);
       }
+      if ("1".equals(field.getAttribute(PRESENCE_KEY))) {
+        NumericDocValues present = in.getNorms(field);
+        if (present != null) return new PresentNorms(norms, present);
+      }
       return new ByteNorms(norms);
     }
 
@@ -120,6 +131,47 @@ final class LuxirNormsFormat extends NormsFormat {
     @Override
     public void close() throws IOException {
       IOUtils.close(in, luxir);
+    }
+  }
+
+  /** Luxir's norm bytes for the docs Lucene's norms list: a doc whose text has no tokens has norm 0. */
+  private static final class PresentNorms extends NumericDocValues {
+    private final byte[] norms;
+    private final NumericDocValues present;
+
+    PresentNorms(byte[] norms, NumericDocValues present) {
+      this.norms = norms;
+      this.present = present;
+    }
+
+    @Override
+    public long longValue() {
+      return norms[present.docID()];
+    }
+
+    @Override
+    public boolean advanceExact(int target) throws IOException {
+      return present.advanceExact(target);
+    }
+
+    @Override
+    public int docID() {
+      return present.docID();
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+      return present.nextDoc();
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+      return present.advance(target);
+    }
+
+    @Override
+    public long cost() {
+      return present.cost();
     }
   }
 

@@ -629,6 +629,19 @@ int32_t lxl_writer_field_stats(lxl_writer* w, const char* name, int32_t len, int
     stats[1] = info.docsWithField;
     stats[2] = info.sumDocFreq;
     stats[3] = info.sumTotalTermFreq;
+    if (info.normsFormat != SegFieldInfo::NORMS_NONE) {
+      // Lucene's docCount: docs with a term. The inverter counts every doc given the field, text
+      // without tokens too, whose norm is 0.
+      NormsReader norms(*w->finished, info);
+      int64_t withTokens = 0;
+      if (const uint8_t* flat = norms.flatBase()) {
+        for (int32_t d = 0; d < w->finished->maxDoc(); d++) withTokens += flat[d] != 0;
+      } else {
+        NormsReader::Iterator it(norms);
+        for (int32_t d = it.next(); d != NormsReader::ENDDOC; d = it.next()) withTokens += it.value() != 0;
+      }
+      stats[1] = withTokens;
+    }
     return 1;
   });
 }
@@ -641,7 +654,10 @@ int32_t lxl_writer_field_stats(lxl_writer* w, const char* name, int32_t len, int
 // nothing is opened or verified) plus the open readers it shares.
 std::shared_ptr<IndexReader> openIndex(const std::vector<std::shared_ptr<PostingsReader>>& readers,
                                        const std::vector<uint64_t>& segIds) {
-  static const std::shared_ptr<Schema> schema = Schema::createDefaultSchema();
+  // No fields or suffix templates: each field's type is what its segments persisted. Luxir's default
+  // schema would type fields by name ("*_s" a string, "*_i" an int, ...), which a Solr schema need not
+  // follow: a text field named "title_s" would fail every query.
+  static const std::shared_ptr<Schema> schema = Schema::fromProto(api::SchemaDef{});
   static RegionDir noFiles;
   std::pmr::monotonic_buffer_resource arena;
   std::vector<api::SegmentInfo> segs(readers.size());

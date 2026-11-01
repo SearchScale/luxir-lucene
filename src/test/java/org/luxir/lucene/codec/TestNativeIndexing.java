@@ -26,6 +26,7 @@ import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.PhraseQuery;
 import org.apache.lucene.search.Query;
@@ -65,6 +66,8 @@ public class TestNativeIndexing extends LuceneTestCase {
   };
 
   private static String text(Random r) {
+    // now and then text with no tokens: the doc still has the field (a norm of 0, as Lucene's)
+    if (r.nextInt(15) == 0) return new String[] {"", "   ", ", ; .", "the"}[r.nextInt(4)];
     StringBuilder sb = new StringBuilder();
     int n = 1 + r.nextInt(r.nextInt(10) == 0 ? 300 : 30);
     for (int i = 0; i < n; i++) {
@@ -178,6 +181,10 @@ public class TestNativeIndexing extends LuceneTestCase {
           assertEquals(b.storedFields().document(doc).get("body"), storedBody);
         }
         IndexSearcher ls = new IndexSearcher(lr), cs = new IndexSearcher(cr);
+        for (String field : new String[] {"body", titleField}) {
+          Query exists = new FieldExistsQuery(field);
+          assertEquals(field, cs.count(exists), ls.count(exists));
+        }
         for (int it = 0; it < atLeast(100); it++) {
           Query q = randomQuery(r, analyzer);
           TopDocs expected = cs.search(q, new TopScoreDocCollectorManager(10, Integer.MAX_VALUE));
@@ -256,11 +263,12 @@ public class TestNativeIndexing extends LuceneTestCase {
 
   private static void assertSameNorms(String field, NumericDocValues a, NumericDocValues b) throws IOException {
     assertNotNull(field, a);
+    // the same docs (text without tokens included, with norm 0) and values
     for (int d = b.nextDoc(); d != DocIdSetIterator.NO_MORE_DOCS; d = b.nextDoc()) {
-      if (b.longValue() == 0) continue; // a value with no tokens: Luxir records no norm
-      assertEquals(field + " doc " + d, d, a.advance(d));
+      assertEquals(field + " doc " + d, d, a.nextDoc());
       assertEquals(field + " doc " + d, b.longValue(), a.longValue());
     }
+    assertEquals(field, DocIdSetIterator.NO_MORE_DOCS, a.nextDoc());
   }
 
   private Query randomQuery(Random r, LuxirAnalyzer analyzer) {
