@@ -3308,6 +3308,21 @@ int32_t lxl_numeric_fill_once(lxl_reader* r, const char* name, int32_t name_len,
   });
 }
 
+int32_t lxl_numeric_layout(lxl_reader* r, const char* name, int32_t name_len, int64_t* out) {
+  return guarded([&]() -> int32_t {
+    auto info = findField(*r->postings, std::string_view(name, (size_t)name_len));
+    if (!info) throw std::runtime_error("lxl: no such numeric column");
+    IntColReader col(*r->postings, *info);
+    if (col.multiValued() || !col.denseDocsWithValue()) return 0;
+    InputStream is = r->postings->getInputStreamSeek(info->columnLoc);
+    const char* blocks = is.ptr();
+    out[0] = (int64_t)(uintptr_t)blocks;
+    out[1] = (int64_t)info->columnMetaOff;
+    out[2] = col.numValues();
+    return 1;
+  });
+}
+
 }  // extern "C"
 
 namespace {

@@ -490,6 +490,7 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
     private final Map<String, Integer> ords = new HashMap<>();
     private final List<NativeField> fields = new ArrayList<>();
     private final Terms[] dicts;
+    private final DirectColumn[] directs; // by native field ord, made when first read
     private final DocValuesProducer del;
 
     Producer(SegmentReadState state) throws IOException {
@@ -517,6 +518,7 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
         }
       }
       dicts = new Terms[fields.size()];
+      directs = new DirectColumn[fields.size()];
       IndexInput in = null;
       NativeStore.Opened s = null;
       DocValuesProducer d = null;
@@ -541,6 +543,30 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
       return ord == null ? -1 : ord;
     }
 
+    /** A single-valued column's values (or ordinals): read in place where every doc has one. */
+    private NumericDocValues numeric(int ord) {
+      DirectColumn direct = direct(ord);
+      if (direct != null) return new DirectNumeric(direct);
+      return new NativeNumeric(store, nativeName(ord), fields.get(ord).docCount());
+    }
+
+    private DirectColumn direct(int ord) {
+      synchronized (directs) {
+        if (directs[ord] == null) {
+          byte[] name = nativeName(ord);
+          long[] out = new long[3];
+          int dense;
+          try {
+            dense = check((int) LxlNative.NUMERIC_LAYOUT.invokeExact(store.reader(), heap(name), name.length, heap(out)));
+          } catch (Throwable t) {
+            throw LxlNative.rethrow(t);
+          }
+          directs[ord] = dense == 1 ? new DirectColumn(store.memoryFrom(out[0]), out[1], out[2]) : NOT_DIRECT;
+        }
+        return directs[ord] == NOT_DIRECT ? null : directs[ord];
+      }
+    }
+
     private Terms terms(int ord) {
       synchronized (dicts) {
         if (dicts[ord] == null) dicts[ord] = new Terms(store, ord, fields.get(ord).termCount());
@@ -553,7 +579,7 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
       if (!nativeType(field)) return del == null ? DocValues.emptyNumeric() : del.getNumeric(field);
       int ord = nativeOrd(field);
       if (ord < 0) return DocValues.emptyNumeric();
-      return new NativeNumeric(store, nativeName(ord), fields.get(ord).docCount());
+      return numeric(ord);
     }
 
     @Override
@@ -562,7 +588,7 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
       int ord = nativeOrd(field);
       if (ord < 0) return DocValues.emptySortedNumeric();
       NativeField f = fields.get(ord);
-      if (!f.multi()) return DocValues.singleton(new NativeNumeric(store, nativeName(ord), f.docCount()));
+      if (!f.multi()) return DocValues.singleton(numeric(ord));
       return new NativeSortedNumeric(new Multi(store, nativeName(ord), f.docCount()));
     }
 
@@ -571,7 +597,7 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
       if (!nativeType(field)) return del == null ? DocValues.emptySorted() : del.getSorted(field);
       int ord = nativeOrd(field);
       if (ord < 0) return DocValues.emptySorted();
-      return new NativeSorted(new NativeNumeric(store, nativeName(ord), fields.get(ord).docCount()), terms(ord));
+      return new NativeSorted(numeric(ord), terms(ord));
     }
 
     @Override
@@ -581,7 +607,7 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
       if (ord < 0) return DocValues.emptySortedSet();
       NativeField f = fields.get(ord);
       if (!f.multi()) {
-        NativeNumeric ords = new NativeNumeric(store, nativeName(ord), f.docCount());
+        NumericDocValues ords = numeric(ord);
         return DocValues.singleton(new NativeSorted(ords, terms(ord)));
       }
       return new NativeSortedSet(new Multi(store, nativeName(ord), f.docCount()), terms(ord));
@@ -903,6 +929,49 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
     }
   }
 
+  private static final DirectColumn NOT_DIRECT = new DirectColumn(null, 0, 0);
+
+  /** A single-valued column with a value in every doc (values or ordinals), read in place. */
+  private static final class DirectNumeric extends NumericDocValues {
+    private final DirectColumn column;
+    private int doc = -1;
+
+    DirectNumeric(DirectColumn column) {
+      this.column = column;
+    }
+
+    @Override
+    public long longValue() {
+      return column.get(doc);
+    }
+
+    @Override
+    public boolean advanceExact(int target) {
+      doc = target;
+      return target < column.numValues;
+    }
+
+    @Override
+    public int docID() {
+      return doc;
+    }
+
+    @Override
+    public int nextDoc() {
+      return advance(doc + 1);
+    }
+
+    @Override
+    public int advance(int target) {
+      return doc = target < column.numValues ? target : DocIdSetIterator.NO_MORE_DOCS;
+    }
+
+    @Override
+    public long cost() {
+      return column.numValues;
+    }
+  }
+
   /** A single-valued column (values or ordinals). */
   private static final class NativeNumeric extends NumericDocValues {
     private final Blocks blocks;
@@ -1067,17 +1136,17 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
   }
 
   private static final class NativeSorted extends SortedDocValues {
-    private final NativeNumeric ords;
+    private final NumericDocValues ords;
     private final Terms terms;
     private final BytesRef term = new BytesRef(new byte[64]);
 
-    NativeSorted(NativeNumeric ords, Terms terms) {
+    NativeSorted(NumericDocValues ords, Terms terms) {
       this.ords = ords;
       this.terms = terms;
     }
 
     @Override
-    public int ordValue() {
+    public int ordValue() throws IOException {
       return (int) ords.longValue();
     }
 
@@ -1093,7 +1162,7 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
     }
 
     @Override
-    public boolean advanceExact(int target) {
+    public boolean advanceExact(int target) throws IOException {
       return ords.advanceExact(target);
     }
 
@@ -1103,12 +1172,12 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
     }
 
     @Override
-    public int nextDoc() {
+    public int nextDoc() throws IOException {
       return ords.nextDoc();
     }
 
     @Override
-    public int advance(int target) {
+    public int advance(int target) throws IOException {
       return ords.advance(target);
     }
 

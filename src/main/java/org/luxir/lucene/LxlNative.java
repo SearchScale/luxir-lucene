@@ -26,7 +26,7 @@ import java.nio.file.Path;
  * copying; long-running calls (segment writing, top-k) are linked normally.
  */
 public final class LxlNative {
-  public static final int ABI_VERSION = 8;
+  public static final int ABI_VERSION = 9;
   public static final int MAX_TERM = 255;
   public static final int END = Integer.MAX_VALUE;
   public static final int TERM_START = 1;
@@ -160,6 +160,8 @@ public final class LxlNative {
       throw rethrow(t);
     }
   }
+  public static final MethodHandle NUMERIC_LAYOUT =
+      fn("lxl_numeric_layout", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS), CRITICAL);
   public static final MethodHandle NUMERIC_FILL_ONCE =
       fn("lxl_numeric_fill_once",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT,

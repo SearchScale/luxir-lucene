@@ -90,6 +90,7 @@ final class NativeStore {
   static final class Opened implements Closeable {
     private final Arena arena = Arena.ofShared();
     private final MemorySegment reader;
+    private final MemorySegment memory; // the store, as the native reader reads it
     private volatile boolean closed;
 
     /** {@code in} has had its header checked; {@code entries} must not be empty. */
@@ -111,6 +112,7 @@ final class NativeStore {
           }
           whole = copy;
         }
+        memory = whole;
         int n = entries.size();
         MemorySegment names = arena.allocate(ValueLayout.ADDRESS, n);
         MemorySegment ptrs = arena.allocate(ValueLayout.ADDRESS, n);
@@ -143,6 +145,14 @@ final class NativeStore {
     MemorySegment reader() {
       if (closed) throw new AlreadyClosedException("Luxir segment closed");
       return reader;
+    }
+
+    /**
+     * The store's memory from address on, for reading in place: Lucene's mapping of the file, or
+     * this store's copy of it. Reads through it throw once either is closed.
+     */
+    MemorySegment memoryFrom(long address) {
+      return memory.asSlice(address - memory.address());
     }
 
     void ensureOpen() {
