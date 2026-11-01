@@ -5,6 +5,7 @@ package org.luxir.lucene.search;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -195,16 +196,21 @@ public final class LxlQuery {
       if (scores && docsOnly(t.field())) {
         // Docs-only, norm-free terms (Luxir value strings) score the same in every matching doc
         // (freq 1, norm 1): Lucene's own similarity computes that score; Luxir matches the term.
-        // The statistics are built once, for the score and the term node.
-        if (states == null) states = TermStates.build(searcher, t, true);
+        // The statistics are looked up once, for the score and the term node.
+        long[] st = states != null ? new long[] {states.docFreq(), states.totalTermFreq()} : rawTermStats(t);
         body.write(5);
-        f32(docsOnlyScore(t, states));
+        f32(docsOnlyScore(t, st[0], st[1]));
+        body.write(1);
+        str(t.field().getBytes(StandardCharsets.UTF_8));
+        bytes(t.bytes());
+        termStats(t, st[0], st[1]);
+        return true;
       }
       body.write(1);
       str(t.field().getBytes(StandardCharsets.UTF_8));
       bytes(t.bytes());
       if (states != null) {
-        termStats(t, states);
+        termStats(t, states.docFreq(), states.totalTermFreq());
       } else {
         termStats(t);
       }
@@ -565,9 +571,9 @@ public final class LxlQuery {
   }
 
   /** Lucene's score of a docs-only term in any matching doc (freq 1, norm 1), boost 1. */
-  private float docsOnlyScore(Term t, TermStates states) throws IOException {
-    if (states.docFreq() == 0) return 0f;
-    TermStatistics ts = searcher.termStatistics(t, states.docFreq(), states.totalTermFreq());
+  private float docsOnlyScore(Term t, long docFreq, long totalTermFreq) throws IOException {
+    if (docFreq == 0) return 0f;
+    TermStatistics ts = searcher.termStatistics(t, (int) docFreq, totalTermFreq);
     CollectionStatistics cs = searcher.collectionStatistics(t.field());
     if (ts == null || cs == null) return 0f;
     return searcher.getSimilarity().scorer(1f, cs, ts).score(1f, 1L);
@@ -603,21 +609,16 @@ public final class LxlQuery {
       i64(0);
       return;
     }
-    long[] summed = nativeTermStats(t);
-    if (summed != null) {
-      long df = 0, ttf = 0;
-      if (summed[0] > 0) {
-        TermStatistics ts = searcher.termStatistics(t, (int) summed[0], summed[1]);
-        if (ts != null) {
-          df = ts.docFreq();
-          ttf = ts.totalTermFreq();
-        }
-      }
-      i64(df);
-      i64(ttf);
-      return;
-    }
-    termStats(t, TermStates.build(searcher, t, true));
+    long[] st = rawTermStats(t);
+    termStats(t, st[0], st[1]);
+  }
+
+  /** The term's index-wide docFreq and totalTermFreq, natively where every segment allows. */
+  private long[] rawTermStats(Term t) throws IOException {
+    long[] st = nativeTermStats(t);
+    if (st != null) return st;
+    TermStates states = TermStates.build(searcher, t, true);
+    return new long[] {states.docFreq(), states.totalTermFreq()};
   }
 
   /**
@@ -626,24 +627,39 @@ public final class LxlQuery {
    * not native (or the term is too long for them).
    */
   private long[] nativeTermStats(Term t) throws IOException {
+    if (t.bytes().length > LxlNative.MAX_TERM) return null;
+    byte[] fieldBytes = t.field().getBytes(StandardCharsets.UTF_8);
+    byte[] bytes = BytesRef.deepCopyOf(t.bytes()).bytes;
+    long[] out = new long[2];
     long df = 0, ttf = 0;
     for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
       org.apache.lucene.index.Terms terms = NativeLeaf.unwrap(ctx.reader()).terms(t.field());
       if (terms == null) continue;
-      if (!(terms instanceof org.luxir.lucene.codec.LuxirTerms lt)) return null;
-      long[] st = lt.termStats(t.bytes());
-      if (st == null) return null;
-      df += st[0];
-      ttf += st[1];
+      // by the native reader, not LuxirTerms: Solr loads the codec in another classloader
+      MemorySegment reader = NativeLeaf.nativeReader(terms);
+      if (reader == null) return null;
+      int found;
+      try {
+        found = (int) LxlNative.TERM_STATS.invokeExact(reader, LxlNative.heap(fieldBytes), fieldBytes.length,
+            LxlNative.heap(bytes), bytes.length, LxlNative.heap(out));
+      } catch (Throwable e) {
+        throw LxlNative.rethrow(e);
+      }
+      LxlNative.check(found);
+      if (found == 1) {
+        df += out[0];
+        ttf += out[1];
+      }
     }
     return new long[] {df, ttf};
   }
 
-  private void termStats(Term t, TermStates states) throws IOException {
+  /** Writes the searcher's statistics for a term with these index-wide counts (zeros without scores). */
+  private void termStats(Term t, long docFreq, long totalTermFreq) throws IOException {
     long df = 0, ttf = 0;
     if (scores) {
-      if (states.docFreq() > 0) {
-        TermStatistics ts = searcher.termStatistics(t, states.docFreq(), states.totalTermFreq());
+      if (docFreq > 0) {
+        TermStatistics ts = searcher.termStatistics(t, (int) docFreq, totalTermFreq);
         if (ts != null) {
           df = ts.docFreq();
           ttf = ts.totalTermFreq();

@@ -29,12 +29,16 @@ final class LuxirTermsEnum extends BaseTermsEnum {
   private final LuxirFieldsProducer producer;
   private final byte[] fieldBytes;
   private final LuxirDfa dfa; // null: a full dictionary enum
-  private final NativeHandle handle;
+  private NativeHandle handle; // registered with the native object it owns, when first needed
   private final byte[] termBuf = new byte[LxlNative.MAX_TERM];
   private final BytesRef term = new BytesRef(termBuf, 0, 0);
   private final long[] stats = new long[3]; // docFreq, totalTermFreq, ord
   private final int[] lenOut = new int[1];
   private boolean positioned;
+  // positioned by a one-shot lookup (seekExact), not yet in the native enum: a term's statistics
+  // need no native enum, so TermStates and the like never make one
+  private boolean pending;
+  private final long[] lookedUp = new long[2];
   private final boolean docsOnly; // docs-only postings: freq 1, no positions
 
   LuxirTermsEnum(LuxirFieldsProducer producer, String field) {
@@ -46,12 +50,12 @@ final class LuxirTermsEnum extends BaseTermsEnum {
     this.docsOnly = docsOnly;
     this.fieldBytes = field.getBytes(StandardCharsets.UTF_8);
     this.dfa = dfa;
-    this.handle = NativeHandle.register(this, dfa == null ? LxlNative.TERMS_FREE : LxlNative.INTERSECT_FREE);
   }
 
   /** The owned native object: an lxl_terms, or an lxl_intersect in intersect mode. */
   private MemorySegment h() {
     producer.ensureOpen();
+    if (handle == null) handle = NativeHandle.register(this, dfa == null ? LxlNative.TERMS_FREE : LxlNative.INTERSECT_FREE);
     MemorySegment p = handle.get();
     if (p.address() == 0) {
       try {
@@ -73,8 +77,16 @@ final class LuxirTermsEnum extends BaseTermsEnum {
     return p;
   }
 
+  /** Positions the native enum on the term a one-shot lookup found. */
+  private void sync() {
+    if (!pending) return;
+    pending = false;
+    seek(BytesRef.deepCopyOf(term), term.length, true);
+  }
+
   @Override
   public BytesRef next() throws IOException {
+    sync();
     int rc;
     try {
       rc = dfa == null
@@ -106,6 +118,7 @@ final class LuxirTermsEnum extends BaseTermsEnum {
       Reference.reachabilityFence(this);
     }
     check(rc);
+    pending = false;
     positioned = rc != LxlNative.SEEK_END && (rc == LxlNative.SEEK_FOUND || !exact);
     if (positioned) term.length = lenOut[0];
     return rc;
@@ -115,9 +128,27 @@ final class LuxirTermsEnum extends BaseTermsEnum {
   public boolean seekExact(BytesRef text) throws IOException {
     if (text.length > LxlNative.MAX_TERM) {
       positioned = false;
+      pending = false;
       return false;
     }
-    return seek(text, text.length, true) == LxlNative.SEEK_FOUND;
+    if (dfa != null) return seek(text, text.length, true) == LxlNative.SEEK_FOUND;
+    producer.ensureOpen();
+    int found;
+    try {
+      found = (int) LxlNative.TERM_STATS.invokeExact(producer.nativeReader(), heap(fieldBytes), fieldBytes.length,
+          heap(text.bytes).asSlice(text.offset, text.length), text.length, heap(lookedUp));
+    } catch (Throwable t) {
+      throw LxlNative.rethrow(t);
+    }
+    check(found);
+    pending = positioned = found == 1;
+    if (positioned) {
+      System.arraycopy(text.bytes, text.offset, termBuf, 0, text.length);
+      term.length = text.length;
+      stats[0] = lookedUp[0];
+      stats[1] = lookedUp[1];
+    }
+    return positioned;
   }
 
   @Override
@@ -149,6 +180,7 @@ final class LuxirTermsEnum extends BaseTermsEnum {
       Reference.reachabilityFence(this);
     }
     term.length = check(rc);
+    pending = false;
     positioned = true;
   }
 
@@ -159,6 +191,7 @@ final class LuxirTermsEnum extends BaseTermsEnum {
 
   @Override
   public long ord() {
+    sync();
     return stats[2];
   }
 
@@ -175,6 +208,7 @@ final class LuxirTermsEnum extends BaseTermsEnum {
   @Override
   public PostingsEnum postings(PostingsEnum reuse, int flags) throws IOException {
     if (!positioned) throw new IllegalStateException("terms enum is not positioned");
+    sync();
     boolean positions = !docsOnly && PostingsEnum.featureRequested(flags, PostingsEnum.POSITIONS);
     MemorySegment p;
     try {
