@@ -1,4 +1,4 @@
-From 21bfab5eb298529834526601c6dc3224b5e9d94f Mon Sep 17 00:00:00 2001
+From e3ca3c7f255c248efa3bce1c44ca017dc81aafe8 Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@searchscale.com>
 Date: Tue, 27 Oct 2026 01:27:07 +0530
 Subject: [PATCH 4/4] query: let a PhraseQuery subclass supply its own phrase

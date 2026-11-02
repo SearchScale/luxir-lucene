@@ -1,4 +1,4 @@
-From 26bc3a048931e5e80f20ad9449a3a385e075ada0 Mon Sep 17 00:00:00 2001
+From c74b02888ac16e45a441c3bd3b0be629388fdd6b Mon Sep 17 00:00:00 2001
 From: Ishan Chattopadhyaya <ishan@searchscale.com>
 Date: Fri, 23 Oct 2026 22:24:38 +0530
 Subject: [PATCH 2/4] query: answer sparse range verification from block
