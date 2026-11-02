@@ -43,10 +43,11 @@ public class TestLuxirDocValuesFormat extends BaseDocValuesFormatTestCase {
   }
 
   /**
-   * A column with a value in every doc is read in place (DirectColumn), not through native fills:
-   * every block encoding it decodes, across block boundaries, read in random order and in order.
+   * Single-valued columns are read in place (DirectColumn), not through native fills: those with a
+   * value in every doc, and sparse ones by their docs' bitset; every block encoding, across block
+   * boundaries, read in random order and in order.
    */
-  public void testDenseColumnsReadInPlace() throws Exception {
+  public void testColumnsReadInPlace() throws Exception {
     Random r = random();
     long base = r.nextLong();
     LongUnaryOperator[] shapes = {
@@ -62,7 +63,9 @@ public class TestLuxirDocValuesFormat extends BaseDocValuesFormatTestCase {
     };
     int numDocs = atLeast(9000); // three or more 4096-value blocks
     long[][] expected = new long[shapes.length][numDocs];
+    boolean[][] has = new boolean[shapes.length][numDocs]; // the sparse copies ("p" + shape): some docs only
     int[] ords = new int[numDocs];
+    boolean[] hasOrd = new boolean[numDocs];
     try (Directory dir = newDirectory()) {
       IndexWriterConfig iwc = new IndexWriterConfig().setCodec(codec);
       try (IndexWriter w = new IndexWriter(dir, iwc)) {
@@ -71,9 +74,13 @@ public class TestLuxirDocValuesFormat extends BaseDocValuesFormatTestCase {
           for (int s = 0; s < shapes.length; s++) {
             expected[s][d] = shapes[s].applyAsLong(d);
             doc.add(new NumericDocValuesField("n" + s, expected[s][d]));
+            has[s][d] = r.nextInt(s + 2) == 0; // from half the docs to a few
+            if (has[s][d]) doc.add(new NumericDocValuesField("p" + s, expected[s][d]));
           }
           ords[d] = r.nextInt(300);
           doc.add(new SortedDocValuesField("s", new BytesRef(String.format("%05d", ords[d]))));
+          hasOrd[d] = r.nextInt(4) > 0;
+          if (hasOrd[d]) doc.add(new SortedDocValuesField("sp", new BytesRef(String.format("%05d", ords[d]))));
           w.addDocument(doc);
         }
         w.forceMerge(1);
@@ -96,6 +103,32 @@ public class TestLuxirDocValuesFormat extends BaseDocValuesFormatTestCase {
             assertEquals("shape " + s + " doc " + d, expected[s][d], v.longValue());
           }
           assertEquals(DocIdSetIterator.NO_MORE_DOCS, v.nextDoc());
+        }
+        for (int s = 0; s < shapes.length; s++) {
+          NumericDocValues v = leaf.getNumericDocValues("p" + s);
+          assertEquals("SparseNumeric", v.getClass().getSimpleName());
+          for (int k = 0; k < 2000; k++) {
+            int d = r.nextInt(numDocs);
+            if (v.docID() > d) v = leaf.getNumericDocValues("p" + s);
+            assertEquals("sparse shape " + s + " doc " + d, has[s][d], v.advanceExact(d));
+            if (has[s][d]) assertEquals("sparse shape " + s + " doc " + d, expected[s][d], v.longValue());
+          }
+          v = leaf.getNumericDocValues("p" + s);
+          for (int d = v.nextDoc(), want = 0; ; d = r.nextBoolean() ? v.nextDoc() : v.advance(d + 1)) {
+            while (want < numDocs && !has[s][want]) want++;
+            if (want == numDocs) {
+              assertEquals(DocIdSetIterator.NO_MORE_DOCS, d);
+              break;
+            }
+            assertEquals("sparse shape " + s, want, d);
+            assertEquals("sparse shape " + s + " doc " + d, expected[s][d], v.longValue());
+            want++;
+          }
+        }
+        SortedDocValues sp = leaf.getSortedDocValues("sp");
+        for (int d = 0; d < numDocs; d += 1 + r.nextInt(50)) {
+          assertEquals(hasOrd[d], sp.advanceExact(d));
+          if (hasOrd[d]) assertEquals(String.format("%05d", ords[d]), sp.lookupOrd(sp.ordValue()).utf8ToString());
         }
         SortedDocValues sv = leaf.getSortedDocValues("s");
         for (int d = 0; d < numDocs; d += 1 + r.nextInt(50)) {

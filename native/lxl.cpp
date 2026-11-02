@@ -849,6 +849,51 @@ static int16_t* denseTable(MemPool& pool, const automaton::ByteDfaRange* ranges,
   return table;
 }
 
+// The dense table of a DFA (as denseTable), shared through a small per-thread cache: Lucene's fuzzy and
+// spell-checking enums intersect the same automaton with every segment, and again on later requests,
+// and filling the table (up to 128 KB) costs more than the few terms such an intersection visits.
+static std::shared_ptr<const std::vector<int16_t>> sharedDenseTable(const std::vector<automaton::ByteDfaRange>& ranges,
+                                                                    const std::vector<uint32_t>& offsets,
+                                                                    uint32_t numStates) {
+  if ((size_t)numStates * 256 * sizeof(int16_t) > 128 * 1024) return nullptr;
+  struct Entry {
+    uint64_t hash;
+    std::vector<automaton::ByteDfaRange> ranges;
+    std::vector<uint32_t> offsets;
+    std::shared_ptr<const std::vector<int16_t>> table;
+  };
+  thread_local std::vector<Entry> cache;  // most recently used last
+  uint64_t h = 1469598103934665603ULL;
+  auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
+  for (uint32_t o : offsets) mix(o);
+  for (const auto& r : ranges) mix((uint64_t)r.min | ((uint64_t)r.max << 8) | ((uint64_t)(uint32_t)r.dest << 16));
+  auto same = [&](const Entry& e) {
+    if (e.hash != h || e.offsets != offsets || e.ranges.size() != ranges.size()) return false;
+    for (size_t i = 0; i < ranges.size(); i++) {
+      if (e.ranges[i].min != ranges[i].min || e.ranges[i].max != ranges[i].max || e.ranges[i].dest != ranges[i].dest) {
+        return false;
+      }
+    }
+    return true;
+  };
+  for (size_t i = cache.size(); i-- > 0;) {
+    if (same(cache[i])) {
+      auto table = cache[i].table;
+      std::rotate(cache.begin() + (ptrdiff_t)i, cache.begin() + (ptrdiff_t)i + 1, cache.end());
+      return table;
+    }
+  }
+  auto table = std::make_shared<std::vector<int16_t>>((size_t)numStates * 256, (int16_t)automaton::ByteDfaView::DEAD);
+  for (uint32_t st = 0; st < numStates; st++) {
+    for (uint32_t r = offsets[st]; r < offsets[st + 1]; r++) {
+      for (int32_t b = ranges[r].min; b <= ranges[r].max; b++) (*table)[(size_t)st * 256 + (size_t)b] = (int16_t)ranges[r].dest;
+    }
+  }
+  if (cache.size() == 8) cache.erase(cache.begin());
+  cache.push_back({h, ranges, offsets, table});
+  return table;
+}
+
 // Restricts a DFA, entered at `state` after `prefix`, to the terms that sort strictly after `start`:
 // the product with a comparison of the bytes read so far against start, which is still equal to its
 // first k bytes or already greater. A byte below start's next one leaves no term after it, so its
@@ -909,7 +954,7 @@ static int32_t restrictAfter(std::vector<automaton::ByteDfaRange>& ranges, std::
 
 struct lxl_intersect {
   std::unique_ptr<lxl_terms> terms;
-  MemPool tablePool;
+  std::shared_ptr<const std::vector<int16_t>> table;  // the dense transitions, shared (see sharedDenseTable)
   std::vector<automaton::ByteDfaRange> ranges;
   std::vector<uint32_t> offsets;
   std::vector<uint8_t> accepts;
@@ -951,9 +996,9 @@ lxl_intersect* lxl_intersect_new(lxl_reader* r, const char* field, int32_t field
       initial_state = restrictAfter(x->ranges, x->offsets, x->accepts, initial_state, x->prefix, start);
       num_states = (int32_t)x->accepts.size();
     }
+    x->table = sharedDenseTable(x->ranges, x->offsets, (uint32_t)num_states);
     automaton::ByteDfaView view(x->ranges.data(), x->offsets.data(), x->accepts.data(),
-                                denseTable(x->tablePool, x->ranges.data(), x->offsets.data(), (uint32_t)num_states),
-                                (uint32_t)num_states);
+                                x->table ? x->table->data() : nullptr, (uint32_t)num_states);
     DfaScanPlan plan{x->prefix, x->suffix, initial_state};
     x->terms = std::move(terms);
     x->it = std::make_unique<DfaIntersectEnum>(x->terms->pool, *x->terms->te, view, plan);
@@ -3329,13 +3374,30 @@ int32_t lxl_numeric_layout(lxl_reader* r, const char* name, int32_t name_len, in
     auto info = findField(*r->postings, std::string_view(name, (size_t)name_len));
     if (!info) throw std::runtime_error("lxl: no such numeric column");
     IntColReader col(*r->postings, *info);
-    if (col.multiValued() || !col.denseDocsWithValue()) return 0;
+    if (col.multiValued()) return 0;
     InputStream is = r->postings->getInputStreamSeek(info->columnLoc);
     const char* blocks = is.ptr();
     out[0] = (int64_t)(uintptr_t)blocks;
     out[1] = (int64_t)info->columnMetaOff;
     out[2] = col.numValues();
+    out[3] = col.denseDocsWithValue() ? 1 : 0;
     return 1;
+  });
+}
+
+int32_t lxl_numeric_docs(lxl_reader* r, const char* name, int32_t name_len, uint64_t* bits, int32_t words) {
+  return guarded([&]() -> int32_t {
+    auto info = findField(*r->postings, std::string_view(name, (size_t)name_len));
+    if (!info) throw std::runtime_error("lxl: no such numeric column");
+    IntColReader col(*r->postings, *info);
+    IntColReader::SparseIterator it(col);
+    int32_t n = 0;
+    for (int32_t d = it.next(); d != IntColReader::ENDDOC; d = it.next()) {
+      if ((d >> 6) >= words) return fail("lxl: doc past the bitset");
+      bits[d >> 6] |= 1ULL << (d & 63);
+      n++;
+    }
+    return n;
   });
 }
 

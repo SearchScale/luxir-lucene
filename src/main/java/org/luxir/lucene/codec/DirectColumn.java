@@ -32,6 +32,43 @@ final class DirectColumn {
     this.numValues = numValues;
   }
 
+  /** A reader of this column for one thread: it keeps the last block's descriptor, read once per block. */
+  final class Cursor {
+    private long block = -1;
+    private long payload;
+    private int bits;
+    private long mask;
+    private long base;
+    private long gcd;
+    private long slope;
+
+    long get(long rank) {
+      long b = rank >>> BLOCK_SHIFT;
+      if (b != block) {
+        long info = meta + b * 32;
+        long offsetAndBits = blocks.get(LONG, info);
+        bits = (int) (offsetAndBits >>> 56);
+        payload = offsetAndBits & OFFSET_MASK;
+        mask = bits > MAX_PACKED_BITS ? -1L : (1L << bits) - 1;
+        base = blocks.get(LONG, info + 8);
+        gcd = blocks.get(LONG, info + 16);
+        slope = blocks.get(LONG, info + 24);
+        block = b;
+      }
+      long inBlock = rank & ((1 << BLOCK_SHIFT) - 1);
+      if (bits > MAX_PACKED_BITS) return blocks.get(LONG, payload + inBlock * Long.BYTES);
+      long residual = 0;
+      if (bits != 0) {
+        long bitPos = inBlock * bits;
+        residual = (blocks.get(LONG, payload + (bitPos >>> 3)) >>> (bitPos & 7)) & mask;
+      }
+      if (slope != 0) {
+        residual += (inBlock * slope >>> SLOPE_SHIFT) | (Math.multiplyHigh(inBlock, slope) << (64 - SLOPE_SHIFT));
+      }
+      return base + gcd * residual;
+    }
+  }
+
   /** The value at rank (here, the doc), 0 <= rank < numValues. */
   long get(long rank) {
     long info = meta + (rank >>> BLOCK_SHIFT) * 32;

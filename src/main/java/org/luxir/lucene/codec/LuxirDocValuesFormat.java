@@ -490,7 +490,8 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
     private final Map<String, Integer> ords = new HashMap<>();
     private final List<NativeField> fields = new ArrayList<>();
     private final Terms[] dicts;
-    private final DirectColumn[] directs; // by native field ord, made when first read
+    private final Object[] directs; // by native field ord, made when first read: DirectColumn or SparseColumn
+    private final int maxDoc;
     private final DocValuesProducer del;
 
     Producer(SegmentReadState state) throws IOException {
@@ -518,7 +519,8 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
         }
       }
       dicts = new Terms[fields.size()];
-      directs = new DirectColumn[fields.size()];
+      directs = new Object[fields.size()];
+      maxDoc = state.segmentInfo.maxDoc();
       IndexInput in = null;
       NativeStore.Opened s = null;
       DocValuesProducer d = null;
@@ -543,25 +545,31 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
       return ord == null ? -1 : ord;
     }
 
-    /** A single-valued column's values (or ordinals): read in place where every doc has one. */
+    /** A single-valued column's values (or ordinals), read in place. */
     private NumericDocValues numeric(int ord) {
-      DirectColumn direct = direct(ord);
-      if (direct != null) return new DirectNumeric(direct);
+      Object direct = direct(ord);
+      if (direct instanceof DirectColumn d) return new DirectNumeric(d);
+      if (direct instanceof SparseColumn s) return new SparseNumeric(s);
       return new NativeNumeric(store, nativeName(ord), fields.get(ord).docCount());
     }
 
-    private DirectColumn direct(int ord) {
+    private Object direct(int ord) {
       synchronized (directs) {
         if (directs[ord] == null) {
           byte[] name = nativeName(ord);
-          long[] out = new long[3];
-          int dense;
+          long[] out = new long[4];
+          int found;
           try {
-            dense = check((int) LxlNative.NUMERIC_LAYOUT.invokeExact(store.reader(), heap(name), name.length, heap(out)));
+            found = check((int) LxlNative.NUMERIC_LAYOUT.invokeExact(store.reader(), heap(name), name.length, heap(out)));
           } catch (Throwable t) {
             throw LxlNative.rethrow(t);
           }
-          directs[ord] = dense == 1 ? new DirectColumn(store.memoryFrom(out[0]), out[1], out[2]) : NOT_DIRECT;
+          if (found != 1) {
+            directs[ord] = NOT_DIRECT;
+          } else {
+            DirectColumn column = new DirectColumn(store.memoryFrom(out[0]), out[1], out[2]);
+            directs[ord] = out[3] == 1 ? column : SparseColumn.of(column, store, name, maxDoc);
+          }
         }
         return directs[ord] == NOT_DIRECT ? null : directs[ord];
       }
@@ -756,12 +764,6 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
     int i = -1; // current index in the block
     int doc = -1;
     boolean exhausted;
-    // The block holds a window of a query's matches (lxl_numeric_gather), each with or without a
-    // value: it answers advanceExact for those docs, nothing else.
-    boolean gathered;
-    // gathers that found no hinted window; past two, this iterator stops asking (its reads do not
-    // come from a native bulk scorer's matches)
-    private int unhinted;
 
     Blocks(NativeStore.Opened store, byte[] name, long cost, Object owner) {
       this.store = store;
@@ -772,42 +774,6 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
 
     /** Fills the block with docs >= target; returns the count. */
     abstract int fill(int target);
-
-    /**
-     * Fills the block with the calling thread's hinted matches from target on (see
-     * lxl_numeric_gather); 0 if target is not one of them or this column can't.
-     */
-    int gather(int target) {
-      return 0;
-    }
-
-    /** Whether the gathered doc at index j has a value. */
-    boolean present(int j) {
-      return true;
-    }
-
-    /** lxl_numeric_gather from target into the buffers. */
-    int nativeGather(int target, MemorySegment docs, MemorySegment present, MemorySegment values) {
-      try {
-        if (handle == null) {
-          handle = NativeHandle.register(owner, LxlNative.NUMERIC_FREE);
-          handle.set(check((MemorySegment) LxlNative.NUMERIC_NEW.invokeExact(store.reader(), heap(name), name.length)));
-        }
-        fills++;
-        return check((int) LxlNative.NUMERIC_GATHER.invokeExact(handle.get(), target, BLOCK, docs, present, values));
-      } catch (Throwable t) {
-        throw LxlNative.rethrow(t);
-      } finally {
-        Reference.reachabilityFence(owner);
-      }
-    }
-
-    private void leaveGathered() {
-      gathered = false;
-      n = 0;
-      i = -1;
-      exhausted = false;
-    }
 
     /** lxl_numeric_fill of docs >= target into the buffers; the first by a one-shot call. */
     int nativeFill(int target, MemorySegment docs, MemorySegment counts, MemorySegment values, int cap, int valueCap) {
@@ -838,7 +804,6 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
 
     int nextDoc() {
       if (doc == DocIdSetIterator.NO_MORE_DOCS) return doc;
-      if (gathered) leaveGathered();
       if (i + 1 < n) return doc = docs[++i];
       cap = BLOCK; // reading every doc: full blocks
       if (!refill(doc + 1)) return doc = DocIdSetIterator.NO_MORE_DOCS;
@@ -846,33 +811,6 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
     }
 
     int advance(int target) {
-      // a function's values (Lucene's numeric value sources) step with advance: a hinted match with
-      // a value is answered as advanceExact would; anything else needs the column's next doc
-      if (gathered) {
-        if (target <= docs[n - 1]) {
-          int j = Math.max(i, 0);
-          while (docs[j] < target) j++;
-          if (docs[j] == target && present(j)) {
-            i = j;
-            return doc = target;
-          }
-        }
-        leaveGathered();
-      }
-      if (unhinted < 2 && (n == 0 || i >= n || docs[n - 1] < target)) {
-        store.ensureOpen();
-        int got = gather(target);
-        if (got > 0) {
-          unhinted = 0;
-          gathered = true;
-          n = got;
-          i = 0;
-          if (present(0)) return doc = target;
-          leaveGathered();
-        } else {
-          unhinted++;
-        }
-      }
       if (n > 0 && i < n && docs[n - 1] >= target) {
         int j = Math.max(i, 0);
         while (docs[j] < target) j++;
@@ -890,31 +828,6 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
     }
 
     boolean advanceExact(int target) {
-      if (gathered) {
-        if (target <= docs[n - 1]) {
-          int j = Math.max(i, 0);
-          while (docs[j] < target) j++;
-          if (docs[j] == target) {
-            i = j;
-            doc = target;
-            return present(j);
-          }
-        }
-        leaveGathered(); // past the window's gathered matches, or not one of them
-      }
-      if (unhinted < 2 && (n == 0 || i >= n || docs[n - 1] < target)) {
-        store.ensureOpen();
-        int got = gather(target);
-        if (got > 0) {
-          unhinted = 0;
-          gathered = true;
-          n = got;
-          i = 0;
-          doc = target;
-          return present(0);
-        }
-        unhinted++;
-      }
       int d = advance(target);
       if (d == target) return true;
       // stay before the next doc with a value, so nextDoc() still returns it
@@ -931,18 +844,119 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
 
   private static final DirectColumn NOT_DIRECT = new DirectColumn(null, 0, 0);
 
-  /** A single-valued column with a value in every doc (values or ordinals), read in place. */
-  private static final class DirectNumeric extends NumericDocValues {
-    private final DirectColumn column;
+  /**
+   * A single-valued column where only some docs have a value: which ones, as a bitset with each word's
+   * count of earlier docs with values (a doc's value rank), and its values read in place.
+   */
+  static final class SparseColumn {
+    final DirectColumn column;
+    final long[] words;
+    final int[] before; // per word: docs with values in earlier words
+    final int count;
+
+    private SparseColumn(DirectColumn column, long[] words) {
+      this.column = column;
+      this.words = words;
+      this.before = new int[words.length];
+      int c = 0;
+      for (int w = 0; w < words.length; w++) {
+        before[w] = c;
+        c += Long.bitCount(words[w]);
+      }
+      this.count = c;
+    }
+
+    static SparseColumn of(DirectColumn column, NativeStore.Opened store, byte[] name, int maxDoc) {
+      long[] words = new long[Math.max(1, (maxDoc + 63) >>> 6)];
+      try {
+        check((int) LxlNative.NUMERIC_DOCS.invokeExact(store.reader(), heap(name), name.length, heap(words), words.length));
+      } catch (Throwable t) {
+        throw LxlNative.rethrow(t);
+      }
+      return new SparseColumn(column, words);
+    }
+
+    boolean has(int doc) {
+      int w = doc >>> 6;
+      return w < words.length && (words[w] & (1L << doc)) != 0;
+    }
+
+    /** The value rank of a doc with a value. */
+    long rank(int doc) {
+      int w = doc >>> 6;
+      return before[w] + Long.bitCount(words[w] & ((1L << doc) - 1));
+    }
+
+    /** The first doc >= target with a value, or NO_MORE_DOCS. */
+    int next(int target) {
+      int w = target >>> 6;
+      if (w >= words.length) return DocIdSetIterator.NO_MORE_DOCS;
+      long word = words[w] >>> target;
+      if (word != 0) return target + Long.numberOfTrailingZeros(word);
+      while (++w < words.length) {
+        if (words[w] != 0) return (w << 6) + Long.numberOfTrailingZeros(words[w]);
+      }
+      return DocIdSetIterator.NO_MORE_DOCS;
+    }
+  }
+
+  /** A single-valued column with values in some docs (values or ordinals), read in place. */
+  private static final class SparseNumeric extends NumericDocValues {
+    private final SparseColumn column;
+    private final DirectColumn.Cursor values;
     private int doc = -1;
 
-    DirectNumeric(DirectColumn column) {
+    SparseNumeric(SparseColumn column) {
       this.column = column;
+      this.values = column.column.new Cursor();
     }
 
     @Override
     public long longValue() {
-      return column.get(doc);
+      return values.get(column.rank(doc));
+    }
+
+    @Override
+    public boolean advanceExact(int target) {
+      doc = target;
+      return column.has(target);
+    }
+
+    @Override
+    public int docID() {
+      return doc;
+    }
+
+    @Override
+    public int nextDoc() {
+      return advance(doc + 1);
+    }
+
+    @Override
+    public int advance(int target) {
+      return doc = column.next(target);
+    }
+
+    @Override
+    public long cost() {
+      return column.count;
+    }
+  }
+
+  /** A single-valued column with a value in every doc (values or ordinals), read in place. */
+  private static final class DirectNumeric extends NumericDocValues {
+    private final DirectColumn column;
+    private final DirectColumn.Cursor values;
+    private int doc = -1;
+
+    DirectNumeric(DirectColumn column) {
+      this.column = column;
+      this.values = column.new Cursor();
+    }
+
+    @Override
+    public long longValue() {
+      return values.get(doc);
     }
 
     @Override
@@ -976,23 +990,12 @@ final class LuxirDocValuesFormat extends DocValuesFormat {
   private static final class NativeNumeric extends NumericDocValues {
     private final Blocks blocks;
     private final long[] values = new long[Blocks.BLOCK];
-    private final int[] present = new int[Blocks.BLOCK];
 
     NativeNumeric(NativeStore.Opened store, byte[] name, long cost) {
       blocks = new Blocks(store, name, cost, this) {
         @Override
         int fill(int target) {
           return check(nativeFill(target, heap(docs), MemorySegment.NULL, heap(values), cap, BLOCK));
-        }
-
-        @Override
-        int gather(int target) {
-          return nativeGather(target, heap(docs), heap(present), heap(values));
-        }
-
-        @Override
-        boolean present(int j) {
-          return present[j] != 0;
         }
       };
     }

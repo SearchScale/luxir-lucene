@@ -28,7 +28,7 @@ extern "C" {
 
 #define LXL_API __attribute__((visibility("default")))
 
-#define LXL_ABI_VERSION 9
+#define LXL_ABI_VERSION 10
 #define LXL_MAX_TERM 255
 #define LXL_END INT32_MAX
 
@@ -348,11 +348,14 @@ LXL_API int32_t lxl_numeric_values(lxl_numeric* c, const int32_t* docs, int32_t 
 LXL_API int32_t lxl_numeric_fill_once(lxl_reader* r, const char* name, int32_t name_len, int32_t target,
                                       int32_t* docs, int32_t* counts, int64_t* values, int32_t cap,
                                       int32_t value_cap);
-/* Where a single-valued column with a value in every doc (value rank = doc) lies in the store's
- * memory, for callers decoding values in place: out[0] the address of its value blocks, out[1] the
- * offset from there of its block descriptors (NumBlockInfo, 32 bytes each, per 4096 values),
- * out[2] its value count. Returns 1, or 0 (out untouched) for any other column. */
+/* Where a single-valued column lies in the store's memory, for callers decoding values in place:
+ * out[0] the address of its value blocks, out[1] the offset from there of its block descriptors
+ * (NumBlockInfo, 32 bytes each, per 4096 values), out[2] its value count, out[3] 1 if every doc has a
+ * value (value rank = doc), else 0 (a doc's value rank: the docs with values before it, see
+ * lxl_numeric_docs). Returns 1, or 0 (out untouched) for a multi-valued column. */
 LXL_API int32_t lxl_numeric_layout(lxl_reader* r, const char* name, int32_t name_len, int64_t* out);
+/* Sets bit d of bits (words 64-bit words) for each doc d with a value in the column. Returns their count. */
+LXL_API int32_t lxl_numeric_docs(lxl_reader* r, const char* name, int32_t name_len, uint64_t* bits, int32_t words);
 
 /* Points reader (thread-safe). info: leafCount, pointCount, maxPointsPerLeaf.
  * Leaves are in value order (then doc order). */

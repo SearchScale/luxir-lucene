@@ -280,7 +280,6 @@ public class TestLuxirSearch extends LuceneTestCase {
         cs.setQueryCache(null);
         int iters = atLeast(200);
         int ran = 0;
-        long gathers = LxlNative.numericGathers();
         for (int it = 0; it < iters; it++) {
           Query q = valueQuery(r, 0);
           List<Query> filters = new ArrayList<>();
@@ -293,7 +292,6 @@ public class TestLuxirSearch extends LuceneTestCase {
           checkFacets(r, q, filters, ls, cs);
         }
         assertTrue("native path ran for only " + ran + " of " + iters, ran > iters * 0.9);
-        assertTrue("per-match doc values were never gathered", LxlNative.numericGathers() > gathers);
       }
     }
   }

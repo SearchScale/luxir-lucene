@@ -291,15 +291,6 @@ public final class LuxirAcceleratedQuery extends Query {
       } catch (Throwable t) {
         throw LxlNative.rethrow(t);
       }
-      // windows go to the segment's native doc values too, for collectors reading them per match
-      MemorySegment dv = NativeLeaf.docValuesReader(ctx.reader());
-      if (!dv.equals(MemorySegment.NULL)) {
-        try {
-          LxlNative.EXEC_HINT.invokeExact(exec.ptr, dv);
-        } catch (Throwable t) {
-          throw LxlNative.rethrow(t);
-        }
-      }
       started = true;
     }
 
