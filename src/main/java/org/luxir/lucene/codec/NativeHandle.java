@@ -5,15 +5,14 @@ package org.luxir.lucene.codec;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandle;
-import java.lang.ref.Cleaner;
 import org.luxir.lucene.LxlNative;
+import org.luxir.lucene.NativeCleaner;
 
 /**
  * Owns one native object (a terms or postings enum). Lucene enums have no close(), so the object
- * is freed when it is replaced, or by a {@link Cleaner} once its Java owner is unreachable.
+ * is freed when it is replaced, or by {@link NativeCleaner} once its Java owner is unreachable.
  */
 final class NativeHandle implements Runnable {
-  private static final Cleaner CLEANER = Cleaner.create();
 
   private final MethodHandle free;
   private MemorySegment ptr = MemorySegment.NULL;
@@ -25,7 +24,7 @@ final class NativeHandle implements Runnable {
   /** A handle freed by {@code free} when {@code owner} becomes unreachable. */
   static NativeHandle register(Object owner, MethodHandle free) {
     NativeHandle h = new NativeHandle(free);
-    CLEANER.register(owner, h);
+    NativeCleaner.register(owner, h);
     return h;
   }
 

@@ -15,6 +15,7 @@ import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 import org.luxir.lucene.LxlNative;
 
@@ -49,10 +50,15 @@ public final class LuxirFacets {
    * the touched ordinals only (and the matches without a value); null if not native.
    */
   public static OrdCounts sparseOrdCounts(LeafReaderContext ctx, String field, FixedBitSet matches, int numOrds) {
+    return sparseOrdCounts(ctx, field, DocMatches.of(matches), numOrds);
+  }
+
+  /** As {@link #sparseOrdCounts(LeafReaderContext, String, FixedBitSet, int)}, over a doc list or bits. */
+  public static OrdCounts sparseOrdCounts(LeafReaderContext ctx, String field, DocMatches matches, int numOrds) {
     NativeLeaf.NativeColumn col = NativeLeaf.nativeColumn(ctx.reader(), field);
     if (col == null) return null;
     try (Arena arena = Arena.ofConfined()) {
-      NativeLeaf.Words m = words(ctx, matches, arena);
+      DocMatches.Leaf m = matches.leaf(ctx, arena);
       if (m.count() == 0) return new OrdCounts(new int[0], new int[0], 0);
       if (col == NativeLeaf.NO_COLUMN || col.store().equals(MemorySegment.NULL) || numOrds == 0) {
         return new OrdCounts(new int[0], new int[0], m.count());
@@ -66,7 +72,7 @@ public final class LuxirFacets {
         int n;
         try {
           n = (int) LxlNative.COLUMN_ORD_COUNTS_SPARSE.invokeExact(col.store(), name, col.column().length, m.words(),
-              m.count(), ctx.reader().maxDoc(), (long) numOrds, ords, counts, cap, missing);
+              m.docs(), m.count(), ctx.reader().maxDoc(), (long) numOrds, ords, counts, cap, missing);
         } catch (Throwable t) {
           throw LxlNative.rethrow(t);
         }
@@ -98,6 +104,66 @@ public final class LuxirFacets {
     void accept(long value, int count, int firstDoc) throws IOException;
   }
 
+  /** Receives a segment's matches in doc order with their doc values. */
+  @FunctionalInterface
+  public interface DocValueSink {
+    /** {@code doc} within the segment; {@code value} (0 when absent) as the field's doc values hold it. */
+    void accept(int doc, boolean present, long value) throws IOException;
+  }
+
+  /**
+   * Passes each of a segment's matches (index-wide bits), in doc order, with its value of the
+   * single-valued NUMERIC field or ordinal of the SORTED field, read natively in batches; false (with
+   * nothing passed) if the field is not native there.
+   */
+  public static boolean docValues(LeafReaderContext ctx, String field, FixedBitSet matches, DocValueSink sink)
+      throws IOException {
+    NativeLeaf.NativeColumn col = NativeLeaf.nativeColumn(ctx.reader(), field);
+    if (col == null || col.multi()) return false;
+    int base = ctx.docBase, maxDoc = ctx.reader().maxDoc();
+    int end = Math.min(matches.length(), base + maxDoc);
+    if (col == NativeLeaf.NO_COLUMN || col.store().equals(MemorySegment.NULL)) {
+      for (int d = base < end ? matches.nextSetBit(base) : DocIdSetIterator.NO_MORE_DOCS; d < end;
+          d = d + 1 < end ? matches.nextSetBit(d + 1) : DocIdSetIterator.NO_MORE_DOCS) {
+        sink.accept(d - base, false, 0);
+      }
+      return true;
+    }
+    final int batch = 4096;
+    int[] docs = new int[batch], present = new int[batch];
+    long[] values = new long[batch];
+    MemorySegment c;
+    try {
+      c = check((MemorySegment) LxlNative.NUMERIC_NEW.invokeExact(col.store(), LxlNative.heap(col.column()),
+          col.column().length));
+    } catch (Throwable t) {
+      throw LxlNative.rethrow(t);
+    }
+    try {
+      int d = base < end ? matches.nextSetBit(base) : DocIdSetIterator.NO_MORE_DOCS;
+      while (d < end) {
+        int n = 0;
+        for (; n < batch && d < end; d = d + 1 < end ? matches.nextSetBit(d + 1) : DocIdSetIterator.NO_MORE_DOCS) {
+          docs[n++] = d - base;
+        }
+        try {
+          check((int) LxlNative.NUMERIC_VALUES.invokeExact(c, LxlNative.heap(docs), n, LxlNative.heap(present),
+              LxlNative.heap(values)));
+        } catch (Throwable t) {
+          throw LxlNative.rethrow(t);
+        }
+        for (int i = 0; i < n; i++) sink.accept(docs[i], present[i] != 0, values[i]);
+      }
+    } finally {
+      try {
+        LxlNative.NUMERIC_FREE.invokeExact(c);
+      } catch (Throwable t) {
+        throw LxlNative.rethrow(t);
+      }
+    }
+    return true;
+  }
+
   /** Docs with a value sampled before {@link #valueCounts} judges the values mostly distinct. */
   public static final int NEAR_UNIQUE_SAMPLE = 65536;
 
@@ -112,6 +178,11 @@ public final class LuxirFacets {
    * ValueSink)}.
    */
   public static ValueCounts valueCounts(LeafReaderContext ctx, String field, FixedBitSet matches, int sample) {
+    return valueCounts(ctx, field, DocMatches.of(matches), sample);
+  }
+
+  /** As {@link #valueCounts(LeafReaderContext, String, FixedBitSet, int)}. */
+  public static ValueCounts valueCounts(LeafReaderContext ctx, String field, DocMatches matches, int sample) {
     class Lists implements ValueSink {
       long[] v = new long[0];
       int[] c = new int[0], f = new int[0];
@@ -151,10 +222,16 @@ public final class LuxirFacets {
    */
   public static int valueCounts(LeafReaderContext ctx, String field, FixedBitSet matches, int sample, ValueSink sink)
       throws IOException {
+    return valueCounts(ctx, field, DocMatches.of(matches), sample, sink);
+  }
+
+  /** As {@link #valueCounts(LeafReaderContext, String, FixedBitSet, int, ValueSink)}. */
+  public static int valueCounts(LeafReaderContext ctx, String field, DocMatches matches, int sample, ValueSink sink)
+      throws IOException {
     NativeLeaf.NativeColumn col = NativeLeaf.nativeColumn(ctx.reader(), field);
     if (col == null) return -1;
     try (Arena arena = Arena.ofConfined()) {
-      NativeLeaf.Words m = words(ctx, matches, arena);
+      DocMatches.Leaf m = matches.leaf(ctx, arena);
       if (m.count() == 0) return 0;
       if (col == NativeLeaf.NO_COLUMN || col.store().equals(MemorySegment.NULL)) return m.count();
       MemorySegment name = arena.allocateFrom(ValueLayout.JAVA_BYTE, col.column());
@@ -163,7 +240,7 @@ public final class LuxirFacets {
       int n;
       try {
         n = (int) LxlNative.COLUMN_VALUE_COUNTS.invokeExact(col.store(), name, col.column().length, m.words(),
-            m.count(), ctx.reader().maxDoc(), sample, out, missing);
+            m.docs(), m.count(), ctx.reader().maxDoc(), sample, out, missing);
       } catch (Throwable t) {
         throw LxlNative.rethrow(t);
       }

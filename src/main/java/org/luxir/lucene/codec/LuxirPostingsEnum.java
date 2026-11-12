@@ -17,7 +17,7 @@ import org.luxir.lucene.LxlNative;
 /**
  * Lucene postings over a Luxir term. Docs-and-freqs iteration fills a block of {@value #BLOCK}
  * docs per native call; positional iteration makes one call per doc plus one for its positions.
- * The native enum is freed by a Cleaner, so native calls are followed by reachability fences.
+ * The native enum is freed by NativeCleaner, so native calls are followed by reachability fences.
  */
 final class LuxirPostingsEnum extends PostingsEnum {
   static final int BLOCK = 128;
