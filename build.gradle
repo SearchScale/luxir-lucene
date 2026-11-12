@@ -63,3 +63,12 @@ tasks.register('solrBench', JavaExec) {
   jvmArgs '-Xmx20g'
   args((findProperty('solrBenchArgs') ?: '').toString().split(' ').findAll { it })
 }
+
+// Copy a Lucene index and rewrite it with LuxirCodec.
+// ./gradlew luceneToLuxir -PluceneToLuxirArgs='/path/to/source /path/to/dest'
+tasks.register('luceneToLuxir', JavaExec) {
+  classpath = sourceSets.main.runtimeClasspath
+  mainClass = 'org.luxir.lucene.index.LuceneToLuxir'
+  jvmArgs '--enable-native-access=ALL-UNNAMED', "-Dluxir.lucene.library=${nativeLib}"
+  args((findProperty('luceneToLuxirArgs') ?: '').toString().split(' ').findAll { it })
+}
