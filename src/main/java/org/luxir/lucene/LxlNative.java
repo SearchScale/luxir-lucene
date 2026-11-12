@@ -26,7 +26,7 @@ import java.nio.file.Path;
  * copying; long-running calls (segment writing, top-k) are linked normally.
  */
 public final class LxlNative {
-  public static final int ABI_VERSION = 7;
+  public static final int ABI_VERSION = 10;
   public static final int MAX_TERM = 255;
   public static final int END = Integer.MAX_VALUE;
   public static final int TERM_START = 1;
@@ -145,6 +145,29 @@ public final class LxlNative {
   public static final MethodHandle NUMERIC_FILL =
       fn("lxl_numeric_fill",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT), CRITICAL);
+  public static final MethodHandle NUMERIC_GATHER =
+      fn("lxl_numeric_gather", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
+          CRITICAL);
+  public static final MethodHandle NUMERIC_GATHERS = fn("lxl_numeric_gathers", FunctionDescriptor.of(JAVA_LONG));
+  public static final MethodHandle NUMERIC_VALUES =
+      fn("lxl_numeric_values", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS), CRITICAL);
+
+  /** Doc-value gathers of hinted matches done so far (for tests). */
+  public static long numericGathers() {
+    try {
+      return (long) NUMERIC_GATHERS.invokeExact();
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+  public static final MethodHandle NUMERIC_LAYOUT =
+      fn("lxl_numeric_layout", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS), CRITICAL);
+  public static final MethodHandle NUMERIC_DOCS =
+      fn("lxl_numeric_docs", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT), CRITICAL);
+  public static final MethodHandle NUMERIC_FILL_ONCE =
+      fn("lxl_numeric_fill_once",
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT,
+              JAVA_INT), CRITICAL);
   public static final MethodHandle POINTS_NEW =
       fn("lxl_points_new", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS), CRITICAL);
   public static final MethodHandle POINTS_FREE = fn("lxl_points_free", FunctionDescriptor.ofVoid(ADDRESS));
@@ -157,14 +180,20 @@ public final class LxlNative {
       fn("lxl_column_top_k",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT,
               JAVA_INT, JAVA_LONG, ADDRESS, ADDRESS));
+  /** Most sort fields {@link #COLUMNS_TOP_K} takes (LXL_MAX_SORT_KEYS). */
+  public static final int MAX_SORT_KEYS = 4;
+  public static final MethodHandle COLUMNS_TOP_K =
+      fn("lxl_columns_top_k",
+          FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
+              JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS));
   public static final MethodHandle COLUMN_ORD_COUNTS_SPARSE =
       fn("lxl_column_ord_counts_sparse",
-          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_LONG, ADDRESS,
-              ADDRESS, JAVA_INT, ADDRESS));
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_LONG,
+              ADDRESS, ADDRESS, JAVA_INT, ADDRESS));
   public static final MethodHandle COLUMN_VALUE_COUNTS =
       fn("lxl_column_value_counts",
-          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS,
-              ADDRESS));
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT,
+              ADDRESS, ADDRESS));
   public static final MethodHandle VALUE_COUNTS_RELEASE =
       fn("lxl_value_counts_release", FunctionDescriptor.ofVoid());
   public static final MethodHandle COLUMN_RANGE_COUNTS =
@@ -177,9 +206,9 @@ public final class LxlNative {
       fn("lxl_points_set", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS));
   public static final MethodHandle FACET_COLLECT =
       fn("lxl_facet_collect",
-          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT,
-              ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS,
-              ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS));
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT,
+              JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS,
+              ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS));
 
   // native analysis
   public static final MethodHandle ANALYZER_NEW =
@@ -198,6 +227,8 @@ public final class LxlNative {
   public static final MethodHandle READER_FREE = fn("lxl_reader_free", FunctionDescriptor.ofVoid(ADDRESS));
   public static final MethodHandle READER_NORMS =
       fn("lxl_reader_norms", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS), CRITICAL);
+  public static final MethodHandle READER_FIELD_ALIAS =
+      fn("lxl_reader_field_alias", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), CRITICAL);
 
   // terms
   public static final MethodHandle TERMS_NEW =
@@ -205,6 +236,9 @@ public final class LxlNative {
   public static final MethodHandle TERMS_FREE = fn("lxl_terms_free", FunctionDescriptor.ofVoid(ADDRESS));
   public static final MethodHandle TERMS_NEXT =
       fn("lxl_terms_next", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), CRITICAL);
+  public static final MethodHandle TERM_STATS =
+      fn("lxl_term_stats", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, ADDRESS),
+          CRITICAL);
   public static final MethodHandle TERMS_SEEK =
       fn("lxl_terms_seek",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
@@ -216,7 +250,7 @@ public final class LxlNative {
   public static final MethodHandle INTERSECT_NEW =
       fn("lxl_intersect_new",
           FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
-              JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT),
+              JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT),
           CRITICAL);
   public static final MethodHandle INTERSECT_NEXT =
       fn("lxl_intersect_next", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), CRITICAL);
@@ -236,6 +270,8 @@ public final class LxlNative {
       fn("lxl_postings_positions", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), CRITICAL);
 
   // query execution
+  public static final MethodHandle EXEC_HINT =
+      fn("lxl_exec_hint", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS));
   public static final MethodHandle EXEC_NEW =
       fn("lxl_exec_new", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, ADDRESS, JAVA_INT));
   public static final MethodHandle EXEC_FREE = fn("lxl_exec_free", FunctionDescriptor.ofVoid(ADDRESS));
@@ -251,11 +287,22 @@ public final class LxlNative {
   // one search over many segments
   public static final MethodHandle MULTI_NEW = fn("lxl_multi_new", FunctionDescriptor.of(ADDRESS, JAVA_INT, ADDRESS));
   public static final MethodHandle MULTI_FREE = fn("lxl_multi_free", FunctionDescriptor.ofVoid(ADDRESS));
+  public static final MethodHandle JOIN_SORTED =
+      fn("lxl_join_sorted",
+          FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
+              ADDRESS, ADDRESS, ADDRESS, ADDRESS));
   public static final MethodHandle MULTI_TOP_K =
       fn("lxl_multi_top_k",
           FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, JAVA_LONG, ADDRESS,
               ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS,
-              ADDRESS, ADDRESS));
+              ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS));
+  /** lxl_multi_top_k's return when the listed matches would exceed their buffer. */
+  public static final int MATCHES_OVERFLOW = -2;
+  public static final MethodHandle MULTI_TOP_K_SORTED =
+      fn("lxl_multi_top_k_sorted",
+          FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS,
+              JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG,
+              ADDRESS, ADDRESS, ADDRESS, ADDRESS));
 
   static {
     int abi;

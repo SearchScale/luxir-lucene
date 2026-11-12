@@ -12,6 +12,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.ref.Reference;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -103,6 +104,9 @@ final class LuxirStoredFieldsFormat extends StoredFieldsFormat {
     private byte[] data = new byte[1 << 16];
     private int dataLen;
     private long nativeRam;
+    // per field number, what its FieldInfo says (attribute lookups are hash lookups: done once)
+    private byte[] attrs = new byte[32];
+    private static final int KNOWN = 1, KEEP = 2, NATIVE_TEXT = 4, STRING_VALUE = 8, NUMBER_VALUE = 16, NAMED = 32;
 
     Writer(Directory dir, SegmentInfo si, IOContext context) {
       this.dir = dir;
@@ -137,6 +141,22 @@ final class LuxirStoredFieldsFormat extends StoredFieldsFormat {
       return indexer;
     }
 
+    private int attrs(FieldInfo info) {
+      int i = info.number;
+      if (i >= attrs.length) attrs = Arrays.copyOf(attrs, Math.max(i + 1, attrs.length * 2));
+      int a = attrs[i];
+      if (a == 0) {
+        a = KNOWN;
+        if ("1".equals(info.getAttribute(LuxirTextField.STORED))) a |= KEEP;
+        if (LuxirTextField.isNative(info)) a |= NATIVE_TEXT;
+        char kind = LuxirValueField.kind(info);
+        if (kind == 's') a |= STRING_VALUE;
+        if (kind == 'n') a |= NUMBER_VALUE;
+        attrs[i] = (byte) a;
+      }
+      return a;
+    }
+
     /** Starts a value of {@code size} bytes after its tag; returns where the bytes go. */
     private int start(FieldInfo info, byte tag, int size) {
       if (n == docs.length) {
@@ -144,11 +164,15 @@ final class LuxirStoredFieldsFormat extends StoredFieldsFormat {
         fields = ArrayUtil.growExact(fields, docs.length);
         offsets = ArrayUtil.growExact(offsets, docs.length + 1);
       }
-      if (data.length < dataLen + 1 + size) data = ArrayUtil.grow(data, dataLen + 1 + size);
+      // doubled: a batch fills up to BATCH_BYTES, so 1/8 steps would copy it dozens of times
+      if (data.length < dataLen + 1 + size) data = Arrays.copyOf(data, Math.max(dataLen + 1 + size, data.length * 2));
       docs[n] = doc;
       fields[n] = info.number;
       offsets[n] = dataLen;
-      fieldNames.putIfAbsent(info.number, info.name);
+      if ((attrs(info) & NAMED) == 0) {
+        fieldNames.putIfAbsent(info.number, info.name);
+        attrs[info.number] |= NAMED;
+      }
       data[dataLen++] = tag;
       return dataLen;
     }
@@ -164,13 +188,18 @@ final class LuxirStoredFieldsFormat extends StoredFieldsFormat {
       end(p + len);
     }
 
-    private static boolean stored(FieldInfo info) {
-      return "1".equals(info.getAttribute(LuxirTextField.STORED));
+    private boolean stored(FieldInfo info) {
+      return (attrs(info) & KEEP) != 0;
     }
 
     /** Whether a value of this field is a Luxir value (indexed natively), outside merges. */
     private boolean value(FieldInfo info, char kind) {
-      return !merging && LuxirValueField.kind(info) == kind;
+      return !merging && (attrs(info) & (kind == 's' ? STRING_VALUE : NUMBER_VALUE)) != 0;
+    }
+
+    /** Whether this field is Luxir text (analyzed natively), outside merges. */
+    private boolean nativeText(FieldInfo info) {
+      return !merging && (attrs(info) & NATIVE_TEXT) != 0;
     }
 
     private static long point32(int sortable) {
@@ -189,7 +218,7 @@ final class LuxirStoredFieldsFormat extends StoredFieldsFormat {
         if (stored(info)) storeUtf8(info, utf8, 0, utf8.length);
         return;
       }
-      if (!merging && LuxirTextField.isNative(info)) {
+      if (nativeText(info)) {
         indexer(info).add(doc, info, value);
         if (!stored(info)) return;
       }
@@ -204,7 +233,7 @@ final class LuxirStoredFieldsFormat extends StoredFieldsFormat {
         if (stored(info)) storeUtf8(info, value.bytes, value.offset, value.length);
         return;
       }
-      if (!merging && LuxirTextField.isNative(info)) {
+      if (nativeText(info)) {
         // Luxir text given as UTF-8 bytes: straight into the native batch
         indexer(info).add(doc, info, value.bytes, value.offset, value.length);
         if (stored(info)) storeUtf8(info, value.bytes, value.offset, value.length);

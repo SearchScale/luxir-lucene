@@ -10,17 +10,11 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.ref.Reference;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
 import org.apache.lucene.index.BaseTermsEnum;
 import org.apache.lucene.index.ImpactsEnum;
 import org.apache.lucene.index.PostingsEnum;
 import org.apache.lucene.index.SlowImpactsEnum;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.automaton.Automaton;
-import org.apache.lucene.util.automaton.CompiledAutomaton;
-import org.apache.lucene.util.automaton.Transition;
 import org.luxir.lucene.LxlNative;
 
 /**
@@ -28,76 +22,40 @@ import org.luxir.lucene.LxlNative;
  * enumerates the terms a byte DFA accepts, with the whole walk (prefix seek, successor jumps,
  * suffix rejection) done natively by Luxir's DfaIntersectEnum.
  *
- * <p>Native objects are freed by a Cleaner once this enum is unreachable, so every native call is
+ * <p>Native objects are freed by NativeCleaner once this enum is unreachable, so every native call is
  * followed by a reachability fence on {@code this}.
  */
 final class LuxirTermsEnum extends BaseTermsEnum {
-  /** A deterministic byte automaton in the form lxl_intersect_new takes. */
-  record Dfa(byte[] accepts, int[] offsets, int[] ranges, byte[] prefix, int initialState, byte[] suffix) {
-    static Dfa of(CompiledAutomaton compiled) {
-      Automaton a = compiled.automaton;
-      int n = a.getNumStates();
-      if (n == 0) return null;
-      byte[] accepts = new byte[n];
-      int[] offsets = new int[n + 1];
-      List<int[]> all = new ArrayList<>();
-      Transition t = new Transition();
-      for (int s = 0; s < n; s++) {
-        accepts[s] = (byte) (a.isAccept(s) ? 1 : 0);
-        int count = a.initTransition(s, t);
-        int[][] st = new int[count][];
-        for (int i = 0; i < count; i++) {
-          a.getNextTransition(t);
-          if (t.min < 0 || t.max > 255) return null;
-          st[i] = new int[] {t.min, t.max, t.dest};
-        }
-        Arrays.sort(st, (x, y) -> Integer.compare(x[0], y[0]));
-        for (int[] r : st) all.add(r);
-        offsets[s + 1] = all.size();
-      }
-      int[] ranges = new int[all.size() * 3];
-      for (int i = 0; i < all.size(); i++) System.arraycopy(all.get(i), 0, ranges, 3 * i, 3);
-      // Fixed prefix: follow single-byte, non-accepting states from the start.
-      byte[] prefix = new byte[LxlNative.MAX_TERM];
-      int plen = 0, state = 0;
-      while (plen < LxlNative.MAX_TERM && accepts[state] == 0 && offsets[state + 1] - offsets[state] == 1) {
-        int r = offsets[state];
-        if (ranges[3 * r] != ranges[3 * r + 1]) break;
-        prefix[plen++] = (byte) ranges[3 * r];
-        state = ranges[3 * r + 2];
-      }
-      BytesRef cs = compiled.commonSuffixRef;
-      byte[] suffix = cs == null ? new byte[0] : Arrays.copyOfRange(cs.bytes, cs.offset, cs.offset + cs.length);
-      return new Dfa(accepts, offsets, ranges, Arrays.copyOf(prefix, plen), state, suffix);
-    }
-  }
-
   private final LuxirFieldsProducer producer;
   private final byte[] fieldBytes;
-  private final Dfa dfa; // null: a full dictionary enum
-  private final NativeHandle handle;
+  private final LuxirDfa dfa; // null: a full dictionary enum
+  private NativeHandle handle; // registered with the native object it owns, when first needed
   private final byte[] termBuf = new byte[LxlNative.MAX_TERM];
   private final BytesRef term = new BytesRef(termBuf, 0, 0);
   private final long[] stats = new long[3]; // docFreq, totalTermFreq, ord
   private final int[] lenOut = new int[1];
   private boolean positioned;
+  // positioned by a one-shot lookup (seekExact), not yet in the native enum: a term's statistics
+  // need no native enum, so TermStates and the like never make one
+  private boolean pending;
+  private final long[] lookedUp = new long[2];
   private final boolean docsOnly; // docs-only postings: freq 1, no positions
 
   LuxirTermsEnum(LuxirFieldsProducer producer, String field) {
     this(producer, field, null, false);
   }
 
-  LuxirTermsEnum(LuxirFieldsProducer producer, String field, Dfa dfa, boolean docsOnly) {
+  LuxirTermsEnum(LuxirFieldsProducer producer, String field, LuxirDfa dfa, boolean docsOnly) {
     this.producer = producer;
     this.docsOnly = docsOnly;
     this.fieldBytes = field.getBytes(StandardCharsets.UTF_8);
     this.dfa = dfa;
-    this.handle = NativeHandle.register(this, dfa == null ? LxlNative.TERMS_FREE : LxlNative.INTERSECT_FREE);
   }
 
   /** The owned native object: an lxl_terms, or an lxl_intersect in intersect mode. */
   private MemorySegment h() {
     producer.ensureOpen();
+    if (handle == null) handle = NativeHandle.register(this, dfa == null ? LxlNative.TERMS_FREE : LxlNative.INTERSECT_FREE);
     MemorySegment p = handle.get();
     if (p.address() == 0) {
       try {
@@ -107,7 +65,9 @@ final class LuxirTermsEnum extends BaseTermsEnum {
         } else {
           p = check((MemorySegment) LxlNative.INTERSECT_NEW.invokeExact(producer.nativeReader(), heap(fieldBytes),
               fieldBytes.length, dfa.accepts().length, heap(dfa.accepts()), heap(dfa.offsets()), heap(dfa.ranges()),
-              heap(dfa.prefix()), dfa.prefix().length, heap(dfa.suffix()), dfa.suffix().length, dfa.initialState()));
+              heap(dfa.prefix()), dfa.prefix().length, heap(dfa.suffix()), dfa.suffix().length, dfa.initialState(),
+              heap(dfa.startAfter() == null ? new byte[0] : dfa.startAfter()),
+              dfa.startAfter() == null ? -1 : dfa.startAfter().length));
         }
       } catch (Throwable t) {
         throw LxlNative.rethrow(t);
@@ -117,8 +77,16 @@ final class LuxirTermsEnum extends BaseTermsEnum {
     return p;
   }
 
+  /** Positions the native enum on the term a one-shot lookup found. */
+  private void sync() {
+    if (!pending) return;
+    pending = false;
+    seek(BytesRef.deepCopyOf(term), term.length, true);
+  }
+
   @Override
   public BytesRef next() throws IOException {
+    sync();
     int rc;
     try {
       rc = dfa == null
@@ -150,6 +118,7 @@ final class LuxirTermsEnum extends BaseTermsEnum {
       Reference.reachabilityFence(this);
     }
     check(rc);
+    pending = false;
     positioned = rc != LxlNative.SEEK_END && (rc == LxlNative.SEEK_FOUND || !exact);
     if (positioned) term.length = lenOut[0];
     return rc;
@@ -159,9 +128,27 @@ final class LuxirTermsEnum extends BaseTermsEnum {
   public boolean seekExact(BytesRef text) throws IOException {
     if (text.length > LxlNative.MAX_TERM) {
       positioned = false;
+      pending = false;
       return false;
     }
-    return seek(text, text.length, true) == LxlNative.SEEK_FOUND;
+    if (dfa != null) return seek(text, text.length, true) == LxlNative.SEEK_FOUND;
+    producer.ensureOpen();
+    int found;
+    try {
+      found = (int) LxlNative.TERM_STATS.invokeExact(producer.nativeReader(), heap(fieldBytes), fieldBytes.length,
+          heap(text.bytes).asSlice(text.offset, text.length), text.length, heap(lookedUp));
+    } catch (Throwable t) {
+      throw LxlNative.rethrow(t);
+    }
+    check(found);
+    pending = positioned = found == 1;
+    if (positioned) {
+      System.arraycopy(text.bytes, text.offset, termBuf, 0, text.length);
+      term.length = text.length;
+      stats[0] = lookedUp[0];
+      stats[1] = lookedUp[1];
+    }
+    return positioned;
   }
 
   @Override
@@ -193,6 +180,7 @@ final class LuxirTermsEnum extends BaseTermsEnum {
       Reference.reachabilityFence(this);
     }
     term.length = check(rc);
+    pending = false;
     positioned = true;
   }
 
@@ -203,6 +191,7 @@ final class LuxirTermsEnum extends BaseTermsEnum {
 
   @Override
   public long ord() {
+    sync();
     return stats[2];
   }
 
@@ -219,6 +208,7 @@ final class LuxirTermsEnum extends BaseTermsEnum {
   @Override
   public PostingsEnum postings(PostingsEnum reuse, int flags) throws IOException {
     if (!positioned) throw new IllegalStateException("terms enum is not positioned");
+    sync();
     boolean positions = !docsOnly && PostingsEnum.featureRequested(flags, PostingsEnum.POSITIONS);
     MemorySegment p;
     try {

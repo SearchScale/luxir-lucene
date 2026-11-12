@@ -5,6 +5,7 @@ package org.luxir.lucene.search;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -15,6 +16,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.TermStates;
 import org.apache.lucene.search.AutomatonQuery;
@@ -23,6 +25,7 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.CollectionStatistics;
 import org.apache.lucene.search.ConstantScoreQuery;
+import org.apache.lucene.search.DisjunctionMaxQuery;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.IndexOrDocValuesQuery;
 import org.apache.lucene.search.IndexSearcher;
@@ -30,11 +33,11 @@ import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.PhraseQuery;
 import org.apache.lucene.search.PointInSetQuery;
-import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.PointRangeQuery;
 import org.apache.lucene.search.PrefixQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
+import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TermStatistics;
 import org.apache.lucene.search.similarities.BM25Similarity;
@@ -42,14 +45,17 @@ import org.apache.lucene.search.similarities.PerFieldSimilarityWrapper;
 import org.apache.lucene.search.similarities.Similarity;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.ByteRunAutomaton;
+import org.apache.lucene.util.automaton.CompiledAutomaton;
 import org.luxir.lucene.LxlNative;
+import org.luxir.lucene.codec.LuxirDfa;
 
 /**
  * Encodes a rewritten Lucene query for native execution, carrying the searcher's collection-wide
  * BM25 statistics so native scores equal Lucene's.
  *
  * <p>Supported: TermQuery, BooleanQuery (any occurs and minimumShouldMatch, not purely negative),
- * BoostQuery, ConstantScoreQuery, exact PhraseQuery, MatchAll/MatchNoDocsQuery, constant-score prefix, over fields scored by
+ * BoostQuery, ConstantScoreQuery, DisjunctionMaxQuery, PhraseQuery, SpanNearQuery of single distinct terms,
+ * MatchAll/MatchNoDocsQuery, constant-score prefix, over fields scored by
  * BM25Similarity(1.2, 0.75); and, where the caller evaluates them ({@code ranges}), one-dimensional
  * point ranges (PointRangeQuery, alone or as IndexOrDocValuesQuery's index side) as constant-score
  * bitset clauses. Anything else returns null and the caller uses Lucene.
@@ -61,8 +67,10 @@ import org.luxir.lucene.LxlNative;
  * 6 match nothing, 7 match all, 8 constant-score prefix (field, prefix), 9 constant-score bitset
  * clause (slot, score): the caller's per-segment bitset for {@link Encoded#ranges()}[slot], 10
  * numeric range (slot, lo, hi) over the caller's per-segment doc-values column [slot], 11
- * constant-score term set (field, n, then n sorted unique terms). Strings are an int length and
- * bytes.
+ * constant-score term set (field, n, then n sorted unique terms), 12 ordered span near (field, slop,
+ * n, then n x (term, docFreq, ttf)), 13 constant-score byte DFA (field, states, accept flags,
+ * states + 1 range offsets, (min, max, dest) ranges, prefix, initial state, suffix), 14 disjunction
+ * max (tie, n, then n disjuncts), 15 unordered span near (as 12). Strings are an int length and bytes.
  */
 public final class LxlQuery {
   private static final int MAGIC = 0x3151584c; // "LXQ1"
@@ -88,8 +96,15 @@ public final class LxlQuery {
    * with {@code values}, exactly those points (a point set).
    */
   public record Range(String field, long lo, long hi, long[] values) {
+    /** The caller's filter as a bitset clause ({@link FilterSlotQuery}): its bits are the filter's. */
+    static final Range FILTER = new Range(null, 0, -1, null);
+
     Range(String field, long lo, long hi) {
       this(field, lo, hi, null);
+    }
+
+    boolean isFilter() {
+      return this == FILTER;
     }
   }
 
@@ -174,20 +189,28 @@ public final class LxlQuery {
     if (q instanceof TermQuery tq) {
       Term t = tq.getTerm();
       if (!field(t.field()) || t.bytes().length > LxlNative.MAX_TERM) return false;
+      // Rewrites such as fuzzy's blended scoring attach their own (adjusted) statistics; Lucene's
+      // TermWeight uses them when they were built for this searcher.
+      TermStates states = tq.getTermStates();
+      if (states != null && !states.wasBuiltFor(searcher.getTopReaderContext())) states = null;
       if (scores && docsOnly(t.field())) {
         // Docs-only, norm-free terms (Luxir value strings) score the same in every matching doc
         // (freq 1, norm 1): Lucene's own similarity computes that score; Luxir matches the term.
+        // The statistics are looked up once, for the score and the term node.
+        long[] st = states != null ? new long[] {states.docFreq(), states.totalTermFreq()} : rawTermStats(t);
         body.write(5);
-        f32(docsOnlyScore(tq));
+        f32(docsOnlyScore(t, st[0], st[1]));
+        body.write(1);
+        str(t.field().getBytes(StandardCharsets.UTF_8));
+        bytes(t.bytes());
+        termStats(t, st[0], st[1]);
+        return true;
       }
       body.write(1);
       str(t.field().getBytes(StandardCharsets.UTF_8));
       bytes(t.bytes());
-      // Rewrites such as fuzzy's blended scoring attach their own (adjusted) statistics; Lucene's
-      // TermWeight uses them when they were built for this searcher.
-      TermStates states = tq.getTermStates();
-      if (states != null && states.wasBuiltFor(searcher.getTopReaderContext())) {
-        termStats(t, states);
+      if (states != null) {
+        termStats(t, states.docFreq(), states.totalTermFreq());
       } else {
         termStats(t);
       }
@@ -244,10 +267,30 @@ public final class LxlQuery {
     }
     AutomatonQuery automaton = constantScoreAutomaton(q);
     if (automaton != null && !(automaton instanceof PrefixQuery)) {
-      // Lucene's constant-score rewrite of a wildcard/regexp: the union of the matching terms,
-      // expanded through each segment's terms (Luxir's own DFA walk), scoring 1
       String f = automaton.getField();
       if (!field(f)) return false;
+      CompiledAutomaton compiled = automaton.getCompiled();
+      LuxirDfa dfa = compiled.type == CompiledAutomaton.AUTOMATON_TYPE.NORMAL && compiled.automaton != null
+          && compiled.automaton.isDeterministic() ? LuxirDfa.of(compiled, null) : null;
+      if (dfa != null) {
+        // Lucene's constant-score rewrite of a wildcard/regexp: Luxir's automaton query walks each
+        // segment's terms with the same DFA, scoring 1. A segment with overflow terms in the field
+        // (which the native walk cannot see) runs in Lucene.
+        body.write(13);
+        str(f.getBytes(StandardCharsets.UTF_8));
+        int n = dfa.accepts().length;
+        i32(n);
+        str(dfa.accepts());
+        for (int o : dfa.offsets()) i32(o);
+        for (int r : dfa.ranges()) i32(r);
+        str(dfa.prefix());
+        i32(dfa.initialState());
+        str(dfa.suffix());
+        prefixes.add(Map.entry(f, new byte[0]));
+        return true;
+      }
+      // otherwise the union of the matching terms, expanded through each segment's terms (Luxir's
+      // own DFA walk), scoring 1
       java.util.TreeSet<BytesRef> terms = new java.util.TreeSet<>();
       for (org.apache.lucene.index.LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
         org.apache.lucene.index.Terms t = ctx.reader().terms(f);
@@ -324,6 +367,15 @@ public final class LxlQuery {
       }
       return node(iodv.getIndexQuery()); // same matches and constant score
     }
+    if (q instanceof FilterSlotQuery) {
+      if (!allowRanges) return false;
+      ranges.add(Range.FILTER);
+      fieldless = true;
+      body.write(9);
+      i32(ranges.size() - 1);
+      f32(0f); // a FILTER clause: never scored
+      return true;
+    }
     if (q instanceof PointRangeQuery pr) {
       if (!allowRanges || pr.getNumDims() != 1 || pr.getBytesPerDim() > Long.BYTES) return false;
       int bytes = pr.getBytesPerDim();
@@ -350,11 +402,11 @@ public final class LxlQuery {
     }
     if (q instanceof MatchAllDocsQuery) {
       fieldless = true;
-      if (scores) {
-        // Lucene scores every doc 1; Luxir's match-all contributes 0 to a scored sum
-        body.write(5);
-        f32(1f);
-      }
+      // Lucene scores every doc 1; Luxir's match-all contributes 0 to a scored sum. Unscored too:
+      // Luxir's planner takes a bare match-all for its own required non-scoring seed, which as an
+      // optional clause of a nested boolean changed what the enclosing boolean matched.
+      body.write(5);
+      f32(1f);
       body.write(7);
       return true;
     }
@@ -368,12 +420,40 @@ public final class LxlQuery {
       f32(1f);
       return node(c.getQuery());
     }
+    if (LxlSpans.AVAILABLE) {
+      LxlSpans.TermNear near = LxlSpans.termNear(q);
+      if (near != null) {
+        // Lucene's SpanNearQuery of single distinct terms (Solr's {!complexphrase}): Luxir's
+        // phrase scorer with Lucene's NearSpansOrdered or NearSpansUnordered matching and span
+        // frequency
+        if (!field(near.field())) return false;
+        body.write(near.inOrder() ? 12 : 15);
+        str(near.field().getBytes(StandardCharsets.UTF_8));
+        i32(near.slop());
+        i32(near.terms().length);
+        for (Term t : near.terms()) {
+          if (t.bytes().length > LxlNative.MAX_TERM) return false;
+          bytes(t.bytes());
+          termStats(t);
+        }
+        return true;
+      }
+    }
+    if (q instanceof DisjunctionMaxQuery dm) {
+      // Luxir's dis_max: the best disjunct's score plus tie times the others', as Lucene's
+      body.write(14);
+      f32(dm.getTieBreakerMultiplier());
+      i32(dm.getDisjuncts().size());
+      for (Query d : dm.getDisjuncts()) {
+        if (!node(d)) return false;
+      }
+      return true;
+    }
     if (q instanceof PhraseQuery pq) {
       Term[] terms = pq.getTerms();
-      // Sloppy phrases match the same documents, but Lucene's sloppy frequency is a heuristic
-      // that Luxir's matcher does not reproduce exactly (it can find a closer match), so their
-      // scores can differ: leave them to Lucene.
-      if (terms.length < 2 || pq.getSlop() != 0 || !field(pq.getField())) return false;
+      // Sloppy phrases too: Luxir's sloppy matcher follows Lucene's SloppyPhraseMatcher (match
+      // lengths, repeated terms, frequency 1 / (1 + length)), so the scores are the same.
+      if (terms.length < 2 || !field(pq.getField())) return false;
       int[] positions = pq.getPositions();
       body.write(3);
       str(pq.getField().getBytes(StandardCharsets.UTF_8));
@@ -491,14 +571,9 @@ public final class LxlQuery {
   }
 
   /** Lucene's score of a docs-only term in any matching doc (freq 1, norm 1), boost 1. */
-  private float docsOnlyScore(TermQuery tq) throws IOException {
-    Term t = tq.getTerm();
-    TermStates states = tq.getTermStates();
-    if (states == null || !states.wasBuiltFor(searcher.getTopReaderContext())) {
-      states = TermStates.build(searcher, t, true);
-    }
-    if (states.docFreq() == 0) return 0f;
-    TermStatistics ts = searcher.termStatistics(t, states.docFreq(), states.totalTermFreq());
+  private float docsOnlyScore(Term t, long docFreq, long totalTermFreq) throws IOException {
+    if (docFreq == 0) return 0f;
+    TermStatistics ts = searcher.termStatistics(t, (int) docFreq, totalTermFreq);
     CollectionStatistics cs = searcher.collectionStatistics(t.field());
     if (ts == null || cs == null) return 0f;
     return searcher.getSimilarity().scorer(1f, cs, ts).score(1f, 1L);
@@ -529,14 +604,62 @@ public final class LxlQuery {
       i64(-1);
       return;
     }
-    termStats(t, scores ? TermStates.build(searcher, t, true) : null);
+    if (!scores) {
+      i64(0);
+      i64(0);
+      return;
+    }
+    long[] st = rawTermStats(t);
+    termStats(t, st[0], st[1]);
   }
 
-  private void termStats(Term t, TermStates states) throws IOException {
+  /** The term's index-wide docFreq and totalTermFreq, natively where every segment allows. */
+  private long[] rawTermStats(Term t) throws IOException {
+    long[] st = nativeTermStats(t);
+    if (st != null) return st;
+    TermStates states = TermStates.build(searcher, t, true);
+    return new long[] {states.docFreq(), states.totalTermFreq()};
+  }
+
+  /**
+   * The term's index-wide docFreq and totalTermFreq summed from one native lookup per segment (as
+   * TermStates.build sums them, without a terms enum per segment); null if a segment's terms are
+   * not native (or the term is too long for them).
+   */
+  private long[] nativeTermStats(Term t) throws IOException {
+    if (t.bytes().length > LxlNative.MAX_TERM) return null;
+    byte[] fieldBytes = t.field().getBytes(StandardCharsets.UTF_8);
+    byte[] bytes = BytesRef.deepCopyOf(t.bytes()).bytes;
+    long[] out = new long[2];
+    long df = 0, ttf = 0;
+    for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
+      org.apache.lucene.index.Terms terms = NativeLeaf.unwrap(ctx.reader()).terms(t.field());
+      if (terms == null) continue;
+      // by the native reader, not LuxirTerms: Solr loads the codec in another classloader
+      MemorySegment reader = NativeLeaf.nativeReader(terms);
+      if (reader == null) return null;
+      int found;
+      try {
+        found = (int) LxlNative.TERM_STATS.invokeExact(reader, LxlNative.heap(fieldBytes), fieldBytes.length,
+            LxlNative.heap(bytes), bytes.length, LxlNative.heap(out));
+      } catch (Throwable e) {
+        throw LxlNative.rethrow(e);
+      }
+      LxlNative.check(found);
+      if (found == 1) {
+        df += out[0];
+        ttf += out[1];
+      }
+    }
+    return new long[] {df, ttf};
+  }
+
+  /** Writes the searcher's statistics for a term with these index-wide counts (zeros without scores). */
+  private void termStats(Term t, long docFreq, long totalTermFreq) throws IOException {
     long df = 0, ttf = 0;
     if (scores) {
-      if (states.docFreq() > 0) {
-        TermStatistics ts = searcher.termStatistics(t, states.docFreq(), states.totalTermFreq());
+      if (docFreq > 0) {
+        TermStatistics ts = searcher.termStatistics(t, (int) docFreq, totalTermFreq);
         if (ts != null) {
           df = ts.docFreq();
           ttf = ts.totalTermFreq();

@@ -112,6 +112,11 @@ public final class NativeFacetCollector implements AutoCloseable {
 
   /** Collects the segment's matches (an index-wide bitset) to the one slot. */
   public void collectSlot(LeafReaderContext ctx, FixedBitSet matches, int slot) {
+    collectSlot(ctx, DocMatches.of(matches), slot);
+  }
+
+  /** Collects the segment's matches (index-wide) to the one slot. */
+  public void collectSlot(LeafReaderContext ctx, DocMatches matches, int slot) {
     collect(ctx, matches, GROUP_SLOT, null, onlySlot >= 0 ? 0 : slot, null, 0, null, null);
   }
 
@@ -120,6 +125,11 @@ public final class NativeFacetCollector implements AutoCloseable {
    * {@code ordSlots[o]}, or nowhere if that is negative.
    */
   public void collectOrds(LeafReaderContext ctx, FixedBitSet matches, String field, int[] ordSlots) {
+    collectOrds(ctx, DocMatches.of(matches), field, ordSlots);
+  }
+
+  /** As {@link #collectOrds(LeafReaderContext, FixedBitSet, String, int[])}. */
+  public void collectOrds(LeafReaderContext ctx, DocMatches matches, String field, int[] ordSlots) {
     collect(ctx, matches, GROUP_ORDS, field, 0, ordSlots, 0, null, null);
   }
 
@@ -129,10 +139,16 @@ public final class NativeFacetCollector implements AutoCloseable {
    */
   public void collectRanges(LeafReaderContext ctx, FixedBitSet matches, String field, int kind, long[] los,
       long[] his) {
+    collectRanges(ctx, DocMatches.of(matches), field, kind, los, his);
+  }
+
+  /** As {@link #collectRanges(LeafReaderContext, FixedBitSet, String, int, long[], long[])}. */
+  public void collectRanges(LeafReaderContext ctx, DocMatches matches, String field, int kind, long[] los,
+      long[] his) {
     collect(ctx, matches, GROUP_RANGES, field, 0, null, kind, los, his);
   }
 
-  private void collect(LeafReaderContext ctx, FixedBitSet matches, int group, String groupField, int slot,
+  private void collect(LeafReaderContext ctx, DocMatches matches, int group, String groupField, int slot,
       int[] ordSlots, int kind, long[] los, long[] his) {
     NativeLeaf.NativeColumn gcol = groupField == null ? null : NativeLeaf.nativeColumn(ctx.reader(), groupField);
     if (groupField != null && (gcol == null || gcol == NativeLeaf.NO_COLUMN)) {
@@ -151,7 +167,7 @@ public final class NativeFacetCollector implements AutoCloseable {
       offs[a + 1] = names.size();
     }
     try (Arena call = Arena.ofConfined()) {
-      NativeLeaf.Words m = NativeLeaf.liveAndFilter(null, matches, ctx.docBase, ctx.reader().maxDoc(), call);
+      DocMatches.Leaf m = matches.leaf(ctx, call);
       if (m.count() == 0) return;
       if (store.equals(MemorySegment.NULL)) {
         missingOnly(slot, m.count()); // a single slot whose fields have no values here
@@ -168,10 +184,10 @@ public final class NativeFacetCollector implements AutoCloseable {
       MemorySegment nameOffs = call.allocateFrom(ValueLayout.JAVA_INT, offs);
       int rc;
       try {
-        rc = (int) LxlNative.FACET_COLLECT.invokeExact(store, m.words(), m.count(), ctx.reader().maxDoc(), group,
-            gname, gcol == null ? 0 : gcol.column().length, slot, slots, ordSlots == null ? 0L : (long) ordSlots.length,
-            kind, los == null ? 0 : los.length, lo, hi, counts, aggs.size(), nameBytes, nameOffs, ops, types, d0, d1,
-            l0, i0, bits);
+        rc = (int) LxlNative.FACET_COLLECT.invokeExact(store, m.words(), m.docs(), m.count(), ctx.reader().maxDoc(),
+            group, gname, gcol == null ? 0 : gcol.column().length, slot, slots,
+            ordSlots == null ? 0L : (long) ordSlots.length, kind, los == null ? 0 : los.length, lo, hi, counts,
+            aggs.size(), nameBytes, nameOffs, ops, types, d0, d1, l0, i0, bits);
       } catch (Throwable t) {
         throw LxlNative.rethrow(t);
       }

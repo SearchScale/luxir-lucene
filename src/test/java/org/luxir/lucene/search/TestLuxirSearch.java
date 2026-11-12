@@ -12,6 +12,7 @@ import org.apache.lucene.analysis.Analyzer;
 import org.luxir.lucene.document.LuxirValueField;
 import org.apache.lucene.util.NumericUtils;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.IndexOrDocValuesQuery;
 import org.apache.lucene.index.DocValuesType;
@@ -34,6 +35,7 @@ import org.apache.lucene.index.IndexWriter;
 import org.luxir.lucene.LxlNative;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
@@ -41,13 +43,25 @@ import org.apache.lucene.index.LogDocMergePolicy;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SerialMergeScheduler;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.search.AutomatonQuery;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BoostQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
+import org.apache.lucene.search.FieldExistsQuery;
+import org.apache.lucene.search.DisjunctionMaxQuery;
+import org.apache.lucene.search.MatchNoDocsQuery;
+import org.apache.lucene.queries.spans.SpanOrQuery;
 import org.apache.lucene.search.FuzzyQuery;
+import org.apache.lucene.search.similarities.Similarity;
+import org.apache.lucene.search.similarities.PerFieldSimilarityWrapper;
+import org.apache.lucene.search.similarities.ClassicSimilarity;
+import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.PhraseQuery;
+import org.apache.lucene.queries.spans.SpanNearQuery;
+import org.apache.lucene.queries.spans.SpanQuery;
+import org.apache.lucene.queries.spans.SpanTermQuery;
 import org.apache.lucene.search.PrefixQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.RegexpQuery;
@@ -274,6 +288,7 @@ public class TestLuxirSearch extends LuceneTestCase {
           if (checkFiltered(q, filters, ls, cs)) ran++;
           if (filters.isEmpty()) check(q, ls, cs);
           checkSorted(r, q, filters, ls, cs);
+          checkPerHitValues(r, q, ls, cs);
           checkFacets(r, q, filters, ls, cs);
         }
         assertTrue("native path ran for only " + ran + " of " + iters, ran > iters * 0.9);
@@ -322,9 +337,29 @@ public class TestLuxirSearch extends LuceneTestCase {
             : new IndexOrDocValuesQuery(IntPoint.newSetQuery("year", v),
                 NumericDocValuesField.newSlowSetQuery("year", java.util.Arrays.stream(v).asLongStream().toArray()));
       }
-      long[] v = new long[1 + r.nextInt(40)];
-      for (int i = 0; i < v.length; i++) v[i] = 1_300_000_000_000L + r.nextInt(1_000_000_000);
-      return LongPoint.newSetQuery("ts", v);
+      switch (r.nextInt(3)) {
+        case 0: {
+          long[] v = new long[1 + r.nextInt(40)];
+          for (int i = 0; i < v.length; i++) v[i] = 1_300_000_000_000L + r.nextInt(1_000_000_000);
+          return LongPoint.newSetQuery("ts", v);
+        }
+        case 1: {
+          // float and double sets: values taken from the indexed distributions rarely hit exactly,
+          // so include -0f and +0f (distinct points) and whole numbers some docs may hold
+          float[] v = new float[1 + r.nextInt(20)];
+          for (int i = 0; i < v.length; i++) v[i] = r.nextInt(4) == 0 ? (r.nextBoolean() ? -0f : 0f) : (r.nextFloat() - 0.3f) * 1000;
+          return FloatPoint.newSetQuery("pop", v);
+        }
+        default: {
+          double[] v = new double[1 + r.nextInt(20)];
+          for (int i = 0; i < v.length; i++) v[i] = r.nextInt(3) == 0 ? r.nextInt(5) - 2 : r.nextGaussian() * 100;
+          return DoublePoint.newSetQuery("q", v);
+        }
+      }
+    }
+    if (r.nextInt(12) == 0) {
+      // field exists: points answer it natively
+      return new FieldExistsQuery(new String[] {"year", "ts", "pop", "q"}[r.nextInt(4)]);
     }
     switch (r.nextInt(5)) {
       case 0: {
@@ -367,14 +402,108 @@ public class TestLuxirSearch extends LuceneTestCase {
     FixedBitSet want = new FixedBitSet(Math.max(1, cs.getIndexReader().maxDoc()));
     for (ScoreDoc sd : all.scoreDocs) want.set(sd.doc);
     assertEquals(info, want, res.matches());
+    // sparse matches: few come as a sorted doc list, the rest as bits
+    LuxirSearch.Result sparse = LuxirSearch.topK(ls, q, filters, 10, Integer.MAX_VALUE, null, false, true, true);
+    assertEquals(info, res.totalHits(), sparse.totalHits());
+    if (sparse.matchDocs() != null) {
+      assertNull(info, sparse.matches());
+      assertTrue(info, sparse.totalHits() < (ls.getIndexReader().maxDoc() >> 6) + 5);
+      assertArrayEquals(info, docs(want), sparse.matchDocs());
+    } else {
+      assertEquals(info, want, sparse.matches());
+    }
     return true;
+  }
+
+  private static int[] docs(FixedBitSet bits) {
+    int[] out = new int[bits.cardinality()];
+    int n = 0;
+    for (int d = bits.nextSetBit(0); d != DocIdSetIterator.NO_MORE_DOCS;
+        d = d + 1 < bits.length() ? bits.nextSetBit(d + 1) : DocIdSetIterator.NO_MORE_DOCS) {
+      out[n++] = d;
+    }
+    return out;
   }
 
   /** A field sort, natively, must give exactly Lucene's order (ties by doc id). */
   private void checkSorted(Random r, Query q, List<Query> filters, IndexSearcher ls, IndexSearcher cs)
       throws IOException {
+    // one field, or 2-4 distinct fields (kind and year tie often, so later fields decide)
+    List<Integer> picks = new ArrayList<>(List.of(0, 1, 2, 3));
+    java.util.Collections.shuffle(picks, r);
+    int n = r.nextBoolean() ? 1 : 2 + r.nextInt(3);
+    SortField[] fields = new SortField[n];
+    for (int i = 0; i < n; i++) fields[i] = sortField(r, picks.get(i));
+    Sort sort = new Sort(fields);
+    int k = 1 + r.nextInt(20);
+    Query full = LuxirSearch.withFilters(q, filters);
+    String info = full + " sort " + sort;
+    TopDocs expected = cs.search(full, new TopFieldCollectorManager(sort, k, Integer.MAX_VALUE));
+    // without the match set, each segment's top k is kept as matches are found; with it, from its bits
+    boolean wantMatches = r.nextBoolean();
+    LuxirSearch.Result res = n == 1 && r.nextBoolean()
+        ? LuxirSearch.topKSorted(ls, q, filters, fields[0], k, null, wantMatches)
+        : LuxirSearch.topKSorted(ls, q, filters, sort, k, null, false, wantMatches, false);
+    assertNotNull(info + ": " + LuxirSearch.whyNotNative(ls, q, filters), res);
+    assertEquals(info, expected.totalHits.value(), res.totalHits());
+    assertEquals(info, expected.scoreDocs.length, res.docs().length);
+    for (int i = 0; i < res.docs().length; i++) assertEquals(info + " rank " + i, expected.scoreDocs[i].doc, res.docs()[i]);
+  }
+
+  /**
+   * A collector reading doc values per match, as grouping, collapsing and Lucene's comparators do
+   * (Luxir gathers them a window of matches at a time), sometimes skipping fields or stepping with
+   * nextDoc: the values read must be Lucene's.
+   */
+  private void checkPerHitValues(Random r, Query q, IndexSearcher ls, IndexSearcher cs) throws IOException {
+    long seed = r.nextLong();
+    List<String> got = perHitValues(ls, new LuxirAcceleratedQuery(q), new Random(seed));
+    List<String> want = perHitValues(cs, q, new Random(seed));
+    assertEquals(q.toString(), want, got);
+  }
+
+  private static List<String> perHitValues(IndexSearcher s, Query q, Random r) throws IOException {
+    List<String> out = new ArrayList<>();
+    for (LeafReaderContext ctx : s.getIndexReader().leaves()) {
+      org.apache.lucene.search.Weight w = s.createWeight(s.rewrite(q), org.apache.lucene.search.ScoreMode.COMPLETE_NO_SCORES, 1f);
+      org.apache.lucene.search.BulkScorer bs = w.bulkScorer(ctx);
+      if (bs == null) continue;
+      NumericDocValues year = DocValues.getNumeric(ctx.reader(), "year");
+      NumericDocValues ts = DocValues.getNumeric(ctx.reader(), "ts");
+      NumericDocValues pop = DocValues.getNumeric(ctx.reader(), "pop");
+      SortedDocValues kind = DocValues.getSorted(ctx.reader(), "kind");
+      bs.score(new org.apache.lucene.search.LeafCollector() {
+        @Override
+        public void setScorer(org.apache.lucene.search.Scorable scorer) {}
+
+        @Override
+        public void collect(int doc) throws IOException {
+          StringBuilder sb = new StringBuilder().append(ctx.docBase + doc);
+          if (r.nextInt(4) > 0 && year.docID() <= doc) sb.append(" y=").append(year.advanceExact(doc) ? year.longValue() : "-");
+          if (r.nextInt(3) > 0 && ts.docID() <= doc) {
+            // as Lucene's numeric value sources read: advance to the doc, a value if it lands there
+            int at = ts.docID() < doc ? ts.advance(doc) : ts.docID();
+            sb.append(" t=").append(at == doc ? ts.longValue() : "-@" + at);
+          }
+          if (r.nextBoolean() && pop.docID() <= doc) sb.append(" p=").append(pop.advanceExact(doc) ? pop.longValue() : "-");
+          if (r.nextInt(4) > 0 && kind.docID() <= doc) {
+            sb.append(" k=").append(kind.advanceExact(doc) ? kind.lookupOrd(kind.ordValue()).utf8ToString() : "-");
+          }
+          if (r.nextInt(50) == 0 && year.docID() < DocIdSetIterator.NO_MORE_DOCS) {
+            // step off the matches: the next doc with a year, wherever it is
+            int next = year.nextDoc();
+            sb.append(" ny=").append(next).append(next == DocIdSetIterator.NO_MORE_DOCS ? "" : "/" + year.longValue());
+          }
+          out.add(sb.toString());
+        }
+      }, ctx.reader().getLiveDocs(), 0, DocIdSetIterator.NO_MORE_DOCS);
+    }
+    return out;
+  }
+
+  private static SortField sortField(Random r, int which) {
     boolean rev = r.nextBoolean(), withMissing = r.nextBoolean(), low = r.nextBoolean();
-    SortField sf = switch (r.nextInt(4)) {
+    return switch (which) {
       case 0 -> new SortField("year", SortField.Type.INT, rev,
           withMissing ? (low ? Integer.MIN_VALUE : Integer.MAX_VALUE) : null);
       case 1 -> new SortField("ts", SortField.Type.LONG, rev, withMissing ? (low ? Long.MIN_VALUE : Long.MAX_VALUE) : null);
@@ -383,15 +512,6 @@ public class TestLuxirSearch extends LuceneTestCase {
       default -> new SortField("kind", SortField.Type.STRING, rev,
           withMissing ? (low ? SortField.STRING_FIRST : SortField.STRING_LAST) : null);
     };
-    int k = 1 + r.nextInt(20);
-    Query full = LuxirSearch.withFilters(q, filters);
-    String info = full + " sort " + sf;
-    TopDocs expected = cs.search(full, new TopFieldCollectorManager(new Sort(sf), k, Integer.MAX_VALUE));
-    LuxirSearch.Result res = LuxirSearch.topKSorted(ls, q, filters, sf, k, null, false);
-    assertNotNull(info + ": " + LuxirSearch.whyNotNative(ls, q, filters), res);
-    assertEquals(info, expected.totalHits.value(), res.totalHits());
-    assertEquals(info, expected.scoreDocs.length, res.docs().length);
-    for (int i = 0; i < res.docs().length; i++) assertEquals(info + " rank " + i, expected.scoreDocs[i].doc, res.docs()[i]);
   }
 
   /** Native facet counts over a query's matches must equal counting Lucene's doc values. */
@@ -401,6 +521,9 @@ public class TestLuxirSearch extends LuceneTestCase {
     if (res == null) return;
     FixedBitSet m = res.matches();
     String info = LuxirSearch.withFilters(q, filters).toString();
+    // the native facet paths take the matches as bits or as a sorted doc list
+    int[] matchDocs = docs(m);
+    DocMatches[] forms = {DocMatches.of(m), DocMatches.of(matchDocs, matchDocs.length)};
     List<LeafReaderContext> lux = ls.getIndexReader().leaves(), luc = cs.getIndexReader().leaves();
     for (int i = 0; i < lux.size(); i++) {
       LeafReaderContext a = lux.get(i), b = luc.get(i);
@@ -421,6 +544,34 @@ public class TestLuxirSearch extends LuceneTestCase {
         dense[0] = got.missing();
         for (int o = 0; o < got.ords().length; o++) dense[got.ords()[o] + 1] = got.counts()[o];
         assertArrayEquals(info + " " + f + " seg " + i, want, dense);
+        if (f.equals("kind")) {
+          // counts per ordinal and avg(year) per ordinal, collected natively from either form
+          int[] ordSlots = new int[n];
+          for (int o = 0; o < n; o++) ordSlots[o] = o;
+          NumericDocValues years = DocValues.getNumeric(b.reader(), "year");
+          SortedDocValues kinds = DocValues.getSorted(b.reader(), f);
+          double[] wantSum = new double[Math.max(1, n)];
+          int[] wantNum = new int[Math.max(1, n)];
+          for (int d = 0; d < b.reader().maxDoc(); d++) {
+            if (!m.get(b.docBase + d) || !kinds.advanceExact(d) || !years.advanceExact(d)) continue;
+            wantSum[kinds.ordValue()] += (int) years.longValue();
+            wantNum[kinds.ordValue()]++;
+          }
+          for (DocMatches form : forms) {
+            double[] sum = new double[Math.max(1, n)];
+            int[] num = new int[Math.max(1, n)];
+            NativeFacetCollector.Agg avg = new NativeFacetCollector.Agg(NativeFacetCollector.Op.AVG, "year",
+                NativeFacetCollector.ValueType.INT, sum, null, null, num, null);
+            long[] counts;
+            try (NativeFacetCollector c = new NativeFacetCollector(List.of(avg), -1, Math.max(1, n))) {
+              if (n > 0) c.collectOrds(a, form, f, ordSlots);
+              counts = c.finish();
+            }
+            for (int o = 0; o < n; o++) assertEquals(info + " " + f + " count " + o, want[o + 1], counts[o]);
+            assertArrayEquals(info + " avg sums", wantSum, sum, 0);
+            assertArrayEquals(info + " avg counts", wantNum, num);
+          }
+        }
       }
       for (String f : new String[] {"year", "ts", "pop"}) {
         NumericDocValues dv = DocValues.getNumeric(b.reader(), f);
@@ -441,7 +592,7 @@ public class TestLuxirSearch extends LuceneTestCase {
             missing++;
           }
         }
-        LuxirFacets.ValueCounts got = LuxirFacets.valueCounts(a, f, m, sample);
+        LuxirFacets.ValueCounts got = LuxirFacets.valueCounts(a, f, forms[r.nextInt(2)], sample);
         java.util.Map<Long, Integer> gotCounts = new java.util.HashMap<>();
         java.util.Map<Long, Integer> gotFirst = new java.util.HashMap<>();
         for (int j = 0; j < got.values().length; j++) {
@@ -501,6 +652,124 @@ public class TestLuxirSearch extends LuceneTestCase {
   }
 
   /** Returns whether the one-call native path ran. */
+  /**
+   * Searchers scoring with anything but BM25(1.2, 0.75) (Solr's per-field similarities, classic
+   * TF-IDF, tuned BM25): scored queries must fall back to Lucene, and every path must still return
+   * Lucene's hits and scores.
+   */
+  public void testOtherSimilaritiesMatchLucene() throws Exception {
+    Random r = random();
+    int numDocs = atLeast(2000);
+    Analyzer analyzer = new WhitespaceAnalyzer();
+    try (Directory luxDir = dir(r.nextBoolean());
+        Directory lucDir = newDirectory();
+        IndexWriter lux = new IndexWriter(luxDir, config(analyzer, new LuxirCodec(), 500, true));
+        IndexWriter luc = new IndexWriter(lucDir, config(analyzer, Codec.getDefault(), 500, true))) {
+      for (int i = 0; i < numDocs; i++) {
+        StringBuilder sb = new StringBuilder();
+        for (int j = 1 + r.nextInt(30); j > 0; j--) sb.append(word(r)).append(' ');
+        Document d = new Document();
+        d.add(new StringField("id", Integer.toString(i), Field.Store.YES));
+        d.add(new TextField("body", sb.toString(), Field.Store.NO));
+        if (r.nextInt(3) == 0) d.add(new TextField("title", word(r) + " " + word(r), Field.Store.NO));
+        lux.addDocument(d);
+        luc.addDocument(d);
+      }
+      lux.commit();
+      luc.commit();
+      Similarity tuned = new BM25Similarity(0.9f, 0.4f);
+      Similarity[] sims = {
+        new ClassicSimilarity(),
+        tuned,
+        new PerFieldSimilarityWrapper() {
+          @Override
+          public Similarity get(String name) {
+            return name.equals("title") ? tuned : new BM25Similarity();
+          }
+        }
+      };
+      try (DirectoryReader lr = DirectoryReader.open(luxDir);
+          DirectoryReader cr = DirectoryReader.open(lucDir)) {
+        for (Similarity sim : sims) {
+          IndexSearcher ls = new IndexSearcher(lr);
+          IndexSearcher cs = new IndexSearcher(cr);
+          ls.setSimilarity(sim);
+          cs.setSimilarity(sim);
+          ls.setQueryCache(null);
+          cs.setQueryCache(null);
+          for (int it = atLeast(40); it > 0; it--) {
+            Query q = randomQuery(r);
+            String info = sim + ": " + q;
+            TopDocs expected = cs.search(q, new TopScoreDocCollectorManager(10, Integer.MAX_VALUE));
+            TopDocs got = ls.search(new LuxirAcceleratedQuery(q), new TopScoreDocCollectorManager(10, Integer.MAX_VALUE));
+            assertEquals(info, expected.totalHits.value(), got.totalHits.value());
+            assertSameHits(info, expected.scoreDocs, got.scoreDocs);
+            LuxirSearch.Result res = LuxirSearch.topK(ls, q, 10, null, true);
+            if (res != null) {
+              assertEquals(info, expected.totalHits.value(), res.totalHits());
+              assertSameHits(info + " (topK)", expected.scoreDocs, toScoreDocs(res));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Field existence (by norms) where some docs' text has no tokens, alone, negated and counted, by
+   * every Lucene path: Luxir's norms must answer as Lucene's.
+   */
+  public void testFieldExistsWithEmptyText() throws Exception {
+    Random r = random();
+    int numDocs = atLeast(3000);
+    Analyzer analyzer = new WhitespaceAnalyzer();
+    try (Directory luxDir = dir(r.nextBoolean());
+        Directory lucDir = newDirectory();
+        IndexWriter lux = new IndexWriter(luxDir, config(analyzer, new LuxirCodec(), 700, r.nextBoolean()));
+        IndexWriter luc = new IndexWriter(lucDir, config(analyzer, Codec.getDefault(), 700, r.nextBoolean()))) {
+      for (int i = 0; i < numDocs; i++) {
+        Document d = new Document();
+        d.add(new StringField("id", Integer.toString(i), Field.Store.YES));
+        d.add(new TextField("body", word(r) + " " + word(r), Field.Store.NO));
+        // the title: absent, empty (no tokens) or a word
+        int t = r.nextInt(10);
+        if (t > 0) d.add(new TextField("title", t < 3 ? (r.nextBoolean() ? "" : "   ") : word(r), Field.Store.NO));
+        lux.addDocument(d);
+        luc.addDocument(d);
+      }
+      lux.commit();
+      luc.commit();
+      try (DirectoryReader lr = DirectoryReader.open(luxDir);
+          DirectoryReader cr = DirectoryReader.open(lucDir)) {
+        IndexSearcher ls = new IndexSearcher(lr), cs = new IndexSearcher(cr);
+        ls.setQueryCache(null);
+        cs.setQueryCache(null);
+        Query exists = new FieldExistsQuery("title");
+        Query[] queries = {
+          exists,
+          new BooleanQuery.Builder().add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.MUST)
+              .add(exists, BooleanClause.Occur.MUST_NOT).build(),
+          new BooleanQuery.Builder().add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.SHOULD)
+              .add(exists, BooleanClause.Occur.MUST_NOT).build(),
+          new BooleanQuery.Builder().add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.MUST)
+              .add(exists, BooleanClause.Occur.MUST_NOT).build(),
+          new BooleanQuery.Builder().add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.MUST)
+              .add(exists, BooleanClause.Occur.FILTER).build(),
+        };
+        for (Query q : queries) {
+          int want = cs.count(q);
+          assertEquals(q + " (count)", want, ls.count(q));
+          assertEquals(q + " (hits)", want,
+              ls.search(q, new TopScoreDocCollectorManager(1, Integer.MAX_VALUE)).totalHits.value());
+          assertEquals(q + " (accelerated count)", want, ls.count(new LuxirAcceleratedQuery(q)));
+          assertEquals(q + " (accelerated hits)", want,
+              ls.search(new LuxirAcceleratedQuery(q), new TopScoreDocCollectorManager(1, Integer.MAX_VALUE))
+                  .totalHits.value());
+        }
+      }
+    }
+  }
+
   private boolean check(Query q, IndexSearcher ls, IndexSearcher cs) throws IOException {
     String info = q.toString();
     // exact counts and all matches
@@ -516,6 +785,12 @@ public class TestLuxirSearch extends LuceneTestCase {
 
     // one-call top-k + exact count + match set (null: shape not supported natively)
     LuxirSearch.Result res = LuxirSearch.topK(ls, q, 10, null, true);
+    if (q instanceof PhraseQuery pq && pq.getSlop() > 0) assertNotNull(info + ": sloppy phrases run natively", res);
+    if ((q instanceof WildcardQuery || q instanceof RegexpQuery) && ((AutomatonQuery) q).getField().equals("title")) {
+      assertNotNull(info + ": automata run natively", res);
+    }
+    if (q instanceof SpanNearQuery sn && distinctTerms(sn)) assertNotNull(info + ": spans run natively", res);
+    if (q instanceof DisjunctionMaxQuery) assertNotNull(info + ": dismax runs natively", res);
     if (res == null) return false;
     assertEquals(info, expected.totalHits.value(), res.totalHits());
     ScoreDoc[] got = new ScoreDoc[res.docs().length];
@@ -526,6 +801,24 @@ public class TestLuxirSearch extends LuceneTestCase {
     for (ScoreDoc sd : all.scoreDocs) want.set(sd.doc);
     assertEquals(info, want, res.matches());
     assertTrue(info, res.exactCount());
+    // matches wanted sparse: listed natively when few, else bits (and then as Lucene's)
+    LuxirSearch.Result listed = LuxirSearch.topK(ls, q, List.of(), 10, Integer.MAX_VALUE, null, false, true, true);
+    assertEquals(info, expected.totalHits.value(), listed.totalHits());
+    assertSameHits(info + " (listed)", expected.scoreDocs, toScoreDocs(listed));
+    if (listed.matchDocs() != null) {
+      assertArrayEquals(info, docs(want), listed.matchDocs());
+    } else {
+      assertEquals(info, want, listed.matches());
+    }
+    // matches wanted sparse: listed natively when few, else bits (and then as Lucene's)
+    LuxirSearch.Result sparse = LuxirSearch.topK(ls, q, List.of(), 10, Integer.MAX_VALUE, null, false, true, true);
+    assertEquals(info, expected.totalHits.value(), sparse.totalHits());
+    assertSameHits(info + " (sparse)", expected.scoreDocs, toScoreDocs(sparse));
+    if (sparse.matchDocs() != null) {
+      assertArrayEquals(info, docs(want), sparse.matchDocs());
+    } else {
+      assertEquals(info, want, sparse.matches());
+    }
 
     // minExactCount: exact below the threshold, a lower bound of at least the threshold above it
     int threshold = 1 + random().nextInt(50);
@@ -536,6 +829,14 @@ public class TestLuxirSearch extends LuceneTestCase {
       assertEquals(info, actual, bounded.totalHits());
     } else {
       assertTrue(info, bounded.totalHits() >= Math.max(threshold, 10) && bounded.totalHits() <= actual);
+    }
+    return true;
+  }
+
+  private static boolean distinctTerms(SpanNearQuery q) {
+    java.util.Set<Term> seen = new java.util.HashSet<>();
+    for (SpanQuery c : q.getClauses()) {
+      if (!(c instanceof SpanTermQuery t) || !seen.add(t.getTerm())) return false;
     }
     return true;
   }
@@ -555,6 +856,31 @@ public class TestLuxirSearch extends LuceneTestCase {
       // A different doc at a rank is a near-tie (its score already matched within float noise:
       // boolean sums may differ by an ulp, which can reorder docs whose scores almost tie).
     }
+  }
+
+  /** An ordered span near of 2-3 terms (Solr's {!complexphrase inOrder=true}), some perhaps repeated. */
+  private static Query orderedNear(Random r) {
+    return near(r, true);
+  }
+
+  /** A span near of 2-4 terms, some perhaps repeated, in order or not. */
+  private static Query near(Random r, boolean inOrder) {
+    int n = 2 + r.nextInt(inOrder ? 2 : 3);
+    SpanQuery[] clauses = new SpanQuery[n];
+    for (int i = 0; i < n; i++) clauses[i] = new SpanTermQuery(new Term("body", word(r)));
+    return new SpanNearQuery(clauses, r.nextInt(13), inOrder);
+  }
+
+  /** A sloppy phrase of 2-4 terms, some perhaps repeated, at perhaps gapped positions. */
+  private static Query sloppyPhrase(Random r) {
+    PhraseQuery.Builder b = new PhraseQuery.Builder().setSlop(r.nextInt(12));
+    String[] pool = {word(r), word(r), word(r)};
+    int pos = 0;
+    for (int i = 2 + r.nextInt(3); i > 0; i--) {
+      b.add(new Term("body", r.nextInt(3) == 0 ? pool[r.nextInt(pool.length)] : word(r)), pos);
+      pos += r.nextInt(5) == 0 ? 2 : 1;
+    }
+    return b.build();
   }
 
   private Query randomQuery(Random r) {
@@ -578,11 +904,72 @@ public class TestLuxirSearch extends LuceneTestCase {
         case 0:
           return new PrefixQuery(new Term("body", w.substring(0, Math.min(w.length(), 2))));
         case 1:
-          return new WildcardQuery(new Term("body", "w?" + w.charAt(w.length() - 1) + "*"));
+          // title has no overflow terms, so its automata always run natively
+          return new WildcardQuery(new Term(r.nextBoolean() ? "title" : "body", "w?" + w.charAt(w.length() - 1) + "*"));
         case 2:
-          return new RegexpQuery(new Term("body", "w[0-9a-c][a-z0-9]?"));
+          return new RegexpQuery(new Term(r.nextBoolean() ? "title" : "body", "w[0-9a-c][a-z0-9]?"));
         default:
           return new FuzzyQuery(new Term("body", w), 1 + r.nextInt(2));
+      }
+    }
+    if (r.nextInt(10) == 0) {
+      // Shapes that must run natively or fall back to Lucene with the same results
+      switch (r.nextInt(6)) {
+        case 0: {
+          // purely negative (matches nothing in Lucene), alone or required inside a boolean
+          BooleanQuery.Builder neg = new BooleanQuery.Builder();
+          neg.add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.MUST_NOT);
+          if (r.nextBoolean()) return neg.build();
+          return new BooleanQuery.Builder()
+              .add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.SHOULD)
+              .add(neg.build(), BooleanClause.Occur.MUST)
+              .build();
+        }
+        case 1: {
+          // nested booleans with negations and msm at more than one level
+          BooleanQuery.Builder outer = new BooleanQuery.Builder();
+          for (int i = 1 + r.nextInt(3); i > 0; i--) {
+            BooleanQuery.Builder inner = new BooleanQuery.Builder();
+            inner.add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.SHOULD);
+            inner.add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.SHOULD);
+            if (r.nextBoolean()) inner.add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.MUST_NOT);
+            if (r.nextInt(3) == 0) inner.setMinimumNumberShouldMatch(1 + r.nextInt(2));
+            outer.add(inner.build(), r.nextBoolean() ? BooleanClause.Occur.MUST : BooleanClause.Occur.SHOULD);
+          }
+          if (r.nextBoolean()) outer.add(new TermQuery(new Term("body", word(r))), BooleanClause.Occur.MUST_NOT);
+          if (r.nextInt(3) == 0) outer.add(MatchNoDocsQuery.INSTANCE, BooleanClause.Occur.SHOULD);
+          if (r.nextInt(3) == 0) outer.add(MatchAllDocsQuery.INSTANCE, BooleanClause.Occur.FILTER);
+          return outer.build();
+        }
+        case 2: {
+          // unordered span near (Lucene's spans), and a span near nesting a span or
+          SpanQuery[] clauses = new SpanQuery[2 + r.nextInt(2)];
+          for (int i = 0; i < clauses.length; i++) clauses[i] = new SpanTermQuery(new Term("body", word(r)));
+          if (r.nextBoolean()) {
+            clauses[0] = new SpanOrQuery(new SpanTermQuery(new Term("body", word(r))), new SpanTermQuery(new Term("body", word(r))));
+            return new SpanNearQuery(clauses, r.nextInt(6), true);
+          }
+          return new SpanNearQuery(clauses, r.nextInt(6), false);
+        }
+        case 3: {
+          // dismax (edismax over several fields): Lucene scores it
+          List<Query> disjuncts = new ArrayList<>();
+          String w = word(r);
+          disjuncts.add(new TermQuery(new Term("body", w)));
+          disjuncts.add(new BoostQuery(new TermQuery(new Term("title", w)), 2f));
+          return new DisjunctionMaxQuery(disjuncts, r.nextBoolean() ? 0f : 0.1f);
+        }
+        case 4: {
+          // a phrase inside a boolean with a sloppy phrase and an ordered span
+          return new BooleanQuery.Builder()
+              .add(sloppyPhrase(r), BooleanClause.Occur.SHOULD)
+              .add(orderedNear(r), BooleanClause.Occur.SHOULD)
+              .add(new PhraseQuery("body", word(r), word(r)), r.nextBoolean() ? BooleanClause.Occur.SHOULD : BooleanClause.Occur.MUST_NOT)
+              .build();
+        }
+        default:
+          // a deep boost chain over a constant score
+          return new BoostQuery(new BoostQuery(new ConstantScoreQuery(new TermQuery(new Term("body", word(r)))), 2f), 0.25f + r.nextFloat());
       }
     }
     switch (r.nextInt(7)) {
@@ -606,7 +993,25 @@ public class TestLuxirSearch extends LuceneTestCase {
       case 3:
         return new PhraseQuery("body", word(r), word(r));
       case 4:
-        return new PhraseQuery(r.nextInt(3), "body", word(r), word(r));
+        switch (r.nextInt(5)) {
+          case 0:
+            return new PhraseQuery(r.nextInt(3), "body", word(r), word(r));
+          case 1:
+            return sloppyPhrase(r);
+          case 2: {
+            // dismax over fields and phrases (edismax's per-term and phrase-field clauses)
+            List<Query> disjuncts = new ArrayList<>();
+            String w = word(r);
+            disjuncts.add(new TermQuery(new Term("body", w)));
+            disjuncts.add(new BoostQuery(new TermQuery(new Term("title", w)), 1 + 3 * r.nextFloat()));
+            if (r.nextBoolean()) disjuncts.add(new PhraseQuery("body", w, word(r)));
+            return new DisjunctionMaxQuery(disjuncts, r.nextInt(3) == 0 ? 0f : r.nextFloat());
+          }
+          case 3:
+            return near(r, false);
+          default:
+            return orderedNear(r);
+        }
       case 5:
         return new BoostQuery(new TermQuery(new Term("body", word(r))), 0.5f + 3 * r.nextFloat());
       default: {
