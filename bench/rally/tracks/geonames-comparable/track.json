@@ -1,0 +1,162 @@
+{
+  "version": 2,
+  "description": "Geonames operations that Elasticsearch, OpenSearch, and Solr+Luxir can all run. One shard, no replicas, no throughput cap.",
+  "indices": [
+    {
+      "name": "geonames",
+      "body": "index.json"
+    }
+  ],
+  "corpora": [
+    {
+      "name": "geonames",
+      "base-url": "https://rally-tracks.elastic.co/geonames",
+      "documents": [
+        {
+          "source-file": "documents-2.json.bz2",
+          "document-count": 11396503,
+          "compressed-bytes": 265208777,
+          "uncompressed-bytes": 3547613828,
+          "target-index": "geonames"
+        }
+      ]
+    }
+  ],
+  "operations": [
+    {
+      "name": "delete-index",
+      "operation-type": "delete-index"
+    },
+    {
+      "name": "create-index",
+      "operation-type": "create-index"
+    },
+    {
+      "name": "wait-until-healthy",
+      "operation-type": "cluster-health",
+      "index": "geonames",
+      "request-params": {
+        "wait_for_status": "green"
+      },
+      "retry-until-success": true
+    },
+    {
+      "name": "index-append",
+      "operation-type": "bulk",
+      "bulk-size": 5000,
+      "ingest-percentage": {{ ingest_percentage | default(1) }}
+    },
+    {
+      "name": "refresh",
+      "operation-type": "refresh"
+    },
+    {
+      "name": "force-merge",
+      "operation-type": "force-merge",
+      "max-num-segments": 1
+    },
+    {
+      "name": "default",
+      "operation-type": "search",
+      "index": "geonames",
+      "body": {
+        "size": 10,
+        "track_total_hits": true,
+        "_source": false,
+        "query": { "match_all": {} }
+      }
+    },
+    {
+      "name": "term",
+      "operation-type": "search",
+      "index": "geonames",
+      "body": {
+        "size": 10,
+        "track_total_hits": true,
+        "_source": false,
+        "query": { "term": { "country_code.raw": "AT" } }
+      }
+    },
+    {
+      "name": "phrase",
+      "operation-type": "search",
+      "index": "geonames",
+      "body": {
+        "size": 10,
+        "track_total_hits": true,
+        "_source": false,
+        "query": { "match_phrase": { "name": "Sankt Georgen" } }
+      }
+    },
+    {
+      "name": "desc_sort_population",
+      "operation-type": "search",
+      "index": "geonames",
+      "body": {
+        "size": 10,
+        "track_total_hits": true,
+        "_source": false,
+        "query": { "match_all": {} },
+        "sort": [ { "population": "desc" } ]
+      }
+    },
+    {
+      "name": "asc_sort_population",
+      "operation-type": "search",
+      "index": "geonames",
+      "body": {
+        "size": 10,
+        "track_total_hits": true,
+        "_source": false,
+        "query": { "match_all": {} },
+        "sort": [ { "population": "asc" } ]
+      }
+    },
+    {
+      "name": "desc_sort_geonameid",
+      "operation-type": "search",
+      "index": "geonames",
+      "body": {
+        "size": 10,
+        "track_total_hits": true,
+        "_source": false,
+        "query": { "match_all": {} },
+        "sort": [ { "geonameid": "desc" } ]
+      }
+    },
+    {
+      "name": "asc_sort_geonameid",
+      "operation-type": "search",
+      "index": "geonames",
+      "body": {
+        "size": 10,
+        "track_total_hits": true,
+        "_source": false,
+        "query": { "match_all": {} },
+        "sort": [ { "geonameid": "asc" } ]
+      }
+    }
+  ],
+  "challenges": [
+    {
+      "name": "comparable",
+      "description": "Uncapped geonames operations shared by Elasticsearch, OpenSearch, and Solr+Luxir.",
+      "default": true,
+      "schedule": [
+        { "operation": "delete-index" },
+        { "operation": "create-index" },
+        { "operation": "wait-until-healthy" },
+        { "operation": "index-append", "clients": 8 },
+        { "operation": "refresh" },
+        { "operation": "force-merge" },
+        { "operation": "default", "clients": 8, "warmup-time-period": 10, "time-period": 30 },
+        { "operation": "term", "clients": 8, "warmup-time-period": 10, "time-period": 30 },
+        { "operation": "phrase", "clients": 8, "warmup-time-period": 10, "time-period": 30 },
+        { "operation": "desc_sort_population", "clients": 8, "warmup-time-period": 10, "time-period": 30 },
+        { "operation": "asc_sort_population", "clients": 8, "warmup-time-period": 10, "time-period": 30 },
+        { "operation": "desc_sort_geonameid", "clients": 8, "warmup-time-period": 10, "time-period": 30 },
+        { "operation": "asc_sort_geonameid", "clients": 8, "warmup-time-period": 10, "time-period": 30 }
+      ]
+    }
+  ]
+}
