@@ -7,6 +7,7 @@ comparable geonames operations onto one Solr+Luxir core.
 
 import argparse
 import json
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
@@ -121,6 +122,11 @@ class Adapter(BaseHTTPRequestHandler):
     backend = "es"
     upstream = "http://127.0.0.1:9200"
     protocol_version = "HTTP/1.1"
+    # Without TCP_NODELAY, keep-alive clients (Rally) hit ~40 ms delayed-ACK
+    # stalls on every response; this sets the socket option on every connection.
+    disable_nagle_algorithm = True
+    merge_lock = threading.Lock()
+    merge_thread = None
 
     def do_GET(self):
         self._handle()
@@ -185,6 +191,15 @@ class Adapter(BaseHTTPRequestHandler):
         if path.startswith("/_cluster/state"):
             self._send(*es_ok({"cluster_name": "solr-luxir", "master_node": "solr-luxir"}))
             return True
+        if path.startswith("/_tasks"):
+            thread = Adapter.merge_thread
+            if thread is not None and thread.is_alive():
+                payload = {"nodes": {"solr-luxir": {"name": "solr-luxir",
+                       "tasks": {"forcemerge-1": {"action": "indices:admin/forcemerge", "status": "running"}}}}}
+            else:
+                payload = {"nodes": {}}
+            self._send(*es_ok(payload))
+            return True
         if path.startswith("/_nodes"):
             node = {
                 "name": "solr-luxir",
@@ -240,8 +255,22 @@ class Adapter(BaseHTTPRequestHandler):
             self._send(*es_ok({"_shards": {"total": 1, "successful": 1, "failed": 0}}))
             return True
         if path.endswith("/_forcemerge") or path == "/_forcemerge":
-            self._solr_json("/%s/update" % index, {"optimize": {"maxSegments": 1, "waitSearcher": True}})
-            self._send(*es_ok({"_shards": {"total": 1, "successful": 1, "failed": 0}}))
+            # A full-corpus optimize takes minutes; Rally's client times out long
+            # before it finishes and then polls GET /_tasks. Run the optimize in a
+            # tracked background thread so a severed client connection cannot kill
+            # it, report it via the fake /_tasks above, and block this handler
+            # until it completes for any client that waits.
+            with Adapter.merge_lock:
+                if Adapter.merge_thread is None or not Adapter.merge_thread.is_alive():
+                    Adapter.merge_thread = threading.Thread(
+                        target=self._solr_optimize, args=(index,), daemon=True)
+                    Adapter.merge_thread.start()
+                    print("forcemerge started", flush=True)
+            Adapter.merge_thread.join()
+            try:
+                self._send(*es_ok({"_shards": {"total": 1, "successful": 1, "failed": 0}}))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return True
         if path.endswith("/_disk_usage"):
             self._send(*es_ok({"_shards": {"total": 1, "successful": 1, "failed": 0}, index: {"fields": {}}}))
@@ -298,9 +327,18 @@ class Adapter(BaseHTTPRequestHandler):
             return
         raise URLError("solr %s failed (%s): %s" % (action, status, text[:500]))
 
-    def _solr_json(self, path, payload):
+    def _solr_optimize(self, index):
+        try:
+            self._solr_json("/%s/update" % index,
+                            {"optimize": {"maxSegments": 1, "waitSearcher": True}},
+                            timeout=1800)
+            print("forcemerge finished", flush=True)
+        except Exception as error:  # keep the thread alive; the next poll reports done
+            print("forcemerge failed: %s" % error, flush=True)
+
+    def _solr_json(self, path, payload, timeout=120):
         data = json.dumps(payload).encode("utf-8")
-        status, body = self._request(self.upstream + path, data=data, method="POST", headers={"Content-Type": "application/json"})
+        status, body = self._request(self.upstream + path, data=data, method="POST", headers={"Content-Type": "application/json"}, timeout=timeout)
         if status != 200:
             raise URLError("solr %s failed (%s): %s" % (path, status, body.decode("utf-8", "replace")[:500]))
         parsed = json.loads(body)
@@ -311,10 +349,10 @@ class Adapter(BaseHTTPRequestHandler):
     def _solr_get(self, path, params):
         return self._request(self.upstream + path + "?" + urlencode(params), method="GET")
 
-    def _request(self, url, data=None, method="GET", headers=None):
+    def _request(self, url, data=None, method="GET", headers=None, timeout=120):
         request = Request(url, data=data, headers=headers or {}, method=method)
         try:
-            with urlopen(request, timeout=120) as response:
+            with urlopen(request, timeout=timeout) as response:
                 return response.status, response.read()
         except HTTPError as error:
             return error.code, error.read()
@@ -326,8 +364,11 @@ class Adapter(BaseHTTPRequestHandler):
             if key.lower() not in HOP_BY_HOP and key.lower() != "host"
         }
         request = Request(self.upstream + self.path, data=raw or None, headers=headers, method=self.command)
+        # ES keeps the merge task running after the client goes away, so a long
+        # timeout here is safe and lets a patient client wait for completion.
+        timeout = 1800 if "/_forcemerge" in self.path else 120
         try:
-            with urlopen(request, timeout=120) as response:
+            with urlopen(request, timeout=timeout) as response:
                 self._forward(response.status, response.headers, response.read())
         except HTTPError as error:
             self._forward(error.code, error.headers, error.read())
@@ -337,7 +378,10 @@ class Adapter(BaseHTTPRequestHandler):
 
     def _forward(self, status, headers, payload):
         kept = {key: value for key, value in headers.items() if key.lower() not in HOP_BY_HOP}
-        self._send(status, kept, payload)
+        try:
+            self._send(status, kept, payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _send(self, status, headers, payload):
         self.send_response(status)

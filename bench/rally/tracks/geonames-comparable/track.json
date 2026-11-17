@@ -53,7 +53,9 @@
     {
       "name": "force-merge",
       "operation-type": "force-merge",
-      "max-num-segments": 1
+      "max-num-segments": 1,
+      "mode": "polling",
+      "poll-period": 5
     },
     {
       "name": "default",
